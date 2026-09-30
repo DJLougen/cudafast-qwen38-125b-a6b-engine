@@ -3326,7 +3326,9 @@ int main(int argc, char **argv) {
     run_group_scan_boundary_cases();
 
     run_production_expert_cases();
+    fprintf(stderr, "DBG: entering run_pq2_rot_width_cases\n");
     run_pq2_rot_width_cases();
+    fprintf(stderr, "DBG: left run_pq2_rot_width_cases\n");
     run_shared_exact_case(PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM);
     run_shared_exact_case(1056, 1056, 19);
     run_shared_exact_case(32, 32, 17);
