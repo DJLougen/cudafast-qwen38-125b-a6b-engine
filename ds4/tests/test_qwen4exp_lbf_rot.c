@@ -199,6 +199,11 @@ static int run_case(const char *name,
     const int s_same = memcmp(rxs, dxs, xs_n * sizeof(float)) == 0;
     const int m_same = memcmp(rxsum, dxsum, xs_n * sizeof(int32_t)) == 0;
 
+    /* Find the first differing byte BEFORE freeing the buffers. */
+    uint64_t first = UINT64_MAX;
+    for (uint64_t i = 0; i < xq_n; i++)
+        if (rxq[i] != dxq[i]) { first = i; break; }
+
     ds4_gpu_tensor_free(x_t);
     ds4_gpu_tensor_free(s_t);
     ds4_gpu_tensor_free(q_t);
@@ -219,9 +224,6 @@ static int run_case(const char *name,
         return 1;
     }
     if (!q_same || !s_same || !m_same) {
-        uint64_t first = UINT64_MAX;
-        for (uint64_t i = 0; i < xq_n; i++)
-            if (rxq[i] != dxq[i]) { first = i; break; }
         fprintf(stderr, "FAIL %s: byte mismatch (xq=%d xs=%d xsum=%d, "
                 "first xq diff at %" PRIu64 ")\n",
                 name, q_same, s_same, m_same,
