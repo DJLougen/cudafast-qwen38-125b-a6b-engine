@@ -44,6 +44,7 @@ enum {
     TYPE_Q4_K = 12,
     TYPE_Q5_K = 13,
     TYPE_Q6_K = 14,
+    TYPE_PQ2_0 = 142,
 };
 
 /* Production geometry: n_embd 2560, n_ff_exp 640.  The expert count is cut to
@@ -103,6 +104,12 @@ static const expert_type_row OTHER_RECIPE_EXPERT_TYPES[] = {
     { 0, TYPE_Q5_K, TYPE_Q5_1 },   /* MQ-Q5 and MQ-Q6 gate/up */
     { 0, TYPE_Q6_K, TYPE_Q5_1 },   /* MQ-Q6 gate/up */
     { 0, TYPE_Q8_0, TYPE_Q8_0 },   /* the MTP head */
+};
+
+/* The lowbitFlash ternary recipe: every expert tensor is PQ2_0. */
+static const expert_type_row LBF_PQ2_EXPERT_TYPES[] = {
+    { 0, TYPE_PQ2_0, TYPE_PQ2_0 },   /* gate/up and down both ternary */
+    { 1, TYPE_PQ2_0, TYPE_Q8_0 },    /* ternary gate/up, Q8_0 down mix */
 };
 
 enum {
@@ -227,6 +234,18 @@ static double ref_q8_0_value(const uint8_t *block, uint32_t k) {
     return (double)d * (double)(int8_t)xb[2 + (k % 32u)];
 }
 
+/* prism block_pq2_0: 128 ternary codes in 32 payload bytes plus one f16
+ * scale.  Element j sits at payload byte j/4, bits 2*(j%4); the value is
+ * (code - 1) * d, so 00=-d, 01=0, 10=+d and the unused 11=+2d.  See
+ * dequantize_row_pq2_0() in prism ggml-quants.c. */
+static double ref_pq2_0_value(const uint8_t *block, uint32_t k) {
+    const uint8_t *xb = block + (k / 128u) * 34u;
+    const float d = f16_to_f32((uint16_t)(xb[0] | ((uint16_t)xb[1] << 8)));
+    const uint32_t j = k % 128u;
+    const int32_t code = (xb[2u + (j >> 2u)] >> (2u * (j & 3u))) & 3u;
+    return (double)(code - 1) * (double)d;
+}
+
 /* ggml block_q5_K: 256 elements in 176 bytes.  It is Q4_K plus a high-bit
  * plane: the same packed six-bit scale/min pair, the same nibble, and bit
  * `group` of qh[l] as the fifth bit.  See dequantize_row_q5_K(). */
@@ -275,6 +294,7 @@ static double ref_value(uint32_t type, const uint8_t *row, uint32_t k) {
     case TYPE_Q4_K: return ref_q4_K_value(row, k);
     case TYPE_Q5_K: return ref_q5_K_value(row, k);
     case TYPE_Q6_K: return ref_q6_K_value(row, k);
+    case TYPE_PQ2_0: return ref_pq2_0_value(row, k);
     case TYPE_Q5_1: return ref_q5_1_value(row, k);
     case TYPE_Q8_0: return ref_q8_0_value(row, k);
     default: {
@@ -293,6 +313,7 @@ static uint64_t type_row_bytes(uint32_t type, uint32_t elems) {
     case TYPE_Q4_K: return (uint64_t)(elems / 256u) * 144u;
     case TYPE_Q5_K: return (uint64_t)(elems / 256u) * 176u;
     case TYPE_Q6_K: return (uint64_t)(elems / 256u) * 210u;
+    case TYPE_PQ2_0: return (uint64_t)(elems / 128u) * 34u;
     default: return (uint64_t)elems * sizeof(float);
     }
 }
@@ -304,6 +325,7 @@ static const char *type_name(uint32_t type) {
     case TYPE_Q4_K: return "Q4_K";
     case TYPE_Q5_K: return "Q5_K";
     case TYPE_Q6_K: return "Q6_K";
+    case TYPE_PQ2_0: return "PQ2_0";
     default: return "F32";
     }
 }
@@ -373,9 +395,10 @@ static const uint64_t DOWN_EXPERT_BYTES = (uint64_t)OUT_DIM * Q51_ROW_BYTES;
  * Q5_1 down slab so the split-shard path is exercised too. */
 
 static const uint32_t PROD_GATE_UP_TYPES[] = {
-    TYPE_Q4_K, TYPE_Q5_K, TYPE_Q6_K, TYPE_Q8_0,
+    TYPE_Q4_K, TYPE_Q5_K, TYPE_Q6_K, TYPE_Q8_0, TYPE_PQ2_0,
 };
-static const uint32_t PROD_DOWN_TYPES[] = { TYPE_Q5_1, TYPE_Q8_0 };
+static const uint32_t PROD_DOWN_TYPES[] = { TYPE_Q5_1, TYPE_Q8_0,
+    TYPE_PQ2_0 };
 
 static uint32_t prod_type_slot(const uint32_t *types, uint32_t n, uint32_t type) {
     for (uint32_t i = 0; i < n; i++) if (types[i] == type) return i;
@@ -418,6 +441,13 @@ static void prod_seed_row_scales(uint8_t *row, uint32_t type, uint32_t elems) {
         break;
     case TYPE_Q8_0:
         for (uint32_t b = 0; b < elems / 32u; b++) {
+            const uint16_t d = rng_half_scale();
+            uint8_t *blk = row + (uint64_t)b * 34u;
+            blk[0] = (uint8_t)(d & 0xff); blk[1] = (uint8_t)(d >> 8);
+        }
+        break;
+    case TYPE_PQ2_0:
+        for (uint32_t b = 0; b < elems / 128u; b++) {
             const uint16_t d = rng_half_scale();
             uint8_t *blk = row + (uint64_t)b * 34u;
             blk[0] = (uint8_t)(d & 0xff); blk[1] = (uint8_t)(d >> 8);
@@ -504,6 +534,336 @@ static void ref_q8_0_roundtrip(const float *src, float *dst, int n) {
     }
 }
 
+
+/* ------------------------------------------------------------------ */
+/* lowbitFlash rotated PQ2_0 experts at every MoE width.
+ *
+ * Device side: ds4_gpu_qwen4exp_routed_moe_router_rot_tensor applies a
+ * segmented sign + normalised Sylvester FWHT to the shared input inside
+ * its quantiser (rot->in) and to the per-(token, expert-slot) mid before
+ * the down projection's quantiser (rot->mid).  The oracle here rotates in
+ * float -- the same order the kernel uses -- then dequantises the PQ2_0
+ * weight codes in double and dots them against the Q8_0-roundtripped
+ * rotated activation, the same contract the other production cases use.
+ *
+ * The sweep crosses the MMA boundary at 8 tokens and the pair-task gate
+ * at 64 (which PQ2_0 never takes -- pair_tasks requires the q4_K/q5_K/
+ * q8_0 slab types, so the arm under test is the generic MMA instantiation
+ * plus, below 8, the per-row decode kernels).  A negative control rotates
+ * the oracle's mid by one flipped sign: a device path that skipped the
+ * rotation would still match, so a passing control proves the comparison
+ * actually sees the rotated basis. */
+
+/* One row of `width` floats: per segment, sign-multiply then the
+ * normalised Sylvester FWHT, in place.  segs==NULL is the identity. */
+static void lbf_host_rotate(float *row, const float *signs,
+                            const uint32_t *segs, uint32_t n_seg,
+                            uint32_t width) {
+    if (!signs || n_seg == 0) return;
+    uint32_t off = 0;
+    for (uint32_t s = 0; s < n_seg; s++) {
+        const uint32_t bs = segs[s];
+        for (uint32_t k = 0; k < bs; k++)
+            row[off + k] = row[off + k] * signs[off + k];
+        for (uint32_t h = 1; h < bs; h <<= 1)
+            for (uint32_t a = 0; a < bs; a += 2 * h)
+                for (uint32_t j = 0; j < h; j++) {
+                    const float u = row[off + a + j];
+                    const float v = row[off + a + j + h];
+                    row[off + a + j]     = u + v;
+                    row[off + a + j + h] = u - v;
+                }
+        const float norm = 1.0f / sqrtf((float)bs);
+        for (uint32_t k = 0; k < bs; k++) row[off + k] *= norm;
+        off += bs;
+    }
+    if (off != width) fail("lbf_host_rotate segment list does not cover the row");
+}
+
+/* The routed PQ2_0 reference in double: the input is rotated first when
+ * in_signs is set, each (token, slot) mid is rotated and Q8_0-roundtripped
+ * -- the device quantises the rotated mid into the down scratch either
+ * way (standalone pass when rot is live, fused epilogue otherwise) --
+ * then the ternary down rows dot it.  The input row is roundtripped
+ * after its rotation too, matching the kernel's Q8_0 activation. */
+static void pq2_rot_reference(const uint8_t *gate, const uint8_t *up,
+                              const uint8_t *down,
+                              uint32_t n_tokens,
+                              const int32_t *selected, const float *weights,
+                              const float *x,
+                              const float *in_signs, const uint32_t *in_segs,
+                              uint32_t in_n_seg,
+                              const float *mid_signs, const uint32_t *mid_segs,
+                              uint32_t mid_n_seg,
+                              float *out) {
+    const uint64_t gate_row = type_row_bytes(TYPE_PQ2_0, PROD_IN_DIM);
+    const uint64_t down_row = type_row_bytes(TYPE_PQ2_0, PROD_MID_DIM);
+    const uint64_t gate_expert = (uint64_t)PROD_MID_DIM * gate_row;
+    const uint64_t down_expert = (uint64_t)PROD_OUT_DIM * down_row;
+    double *mid = calloc((size_t)PROD_USED * PROD_MID_DIM, sizeof(double));
+    float *xr = malloc((size_t)PROD_IN_DIM * sizeof(float));
+    float *mr = malloc((size_t)PROD_MID_DIM * sizeof(float));
+    if (!mid || !xr || !mr) fail("pq2 rot reference allocation");
+
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        memcpy(xr, x + (size_t)t * PROD_IN_DIM,
+               (size_t)PROD_IN_DIM * sizeof(float));
+        lbf_host_rotate(xr, in_signs, in_segs, in_n_seg, PROD_IN_DIM);
+        ref_q8_0_roundtrip(xr, xr, (int)PROD_IN_DIM);
+        for (uint32_t slot = 0; slot < PROD_USED; slot++) {
+            const int32_t e = selected[t * PROD_USED + slot];
+            const double w = weights[t * PROD_USED + slot];
+            if (e < 0 || e >= (int32_t)PROD_EXPERTS) {
+                for (uint32_t r = 0; r < PROD_MID_DIM; r++)
+                    mid[slot * PROD_MID_DIM + r] = 0.0;
+                continue;
+            }
+            for (uint32_t r = 0; r < PROD_MID_DIM; r++) {
+                const uint8_t *grow = gate + (uint64_t)e * gate_expert +
+                                      (uint64_t)r * gate_row;
+                const uint8_t *urow = up + (uint64_t)e * gate_expert +
+                                      (uint64_t)r * gate_row;
+                double g = 0.0, u = 0.0;
+                for (uint32_t k = 0; k < PROD_IN_DIM; k++) {
+                    const double xv = xr[k];
+                    g += ref_pq2_0_value(grow, k) * xv;
+                    u += ref_pq2_0_value(urow, k) * xv;
+                }
+                mid[slot * PROD_MID_DIM + r] = (g / (1.0 + exp(-g))) * u * w;
+            }
+            for (uint32_t r = 0; r < PROD_MID_DIM; r++)
+                mr[r] = (float)mid[slot * PROD_MID_DIM + r];
+            lbf_host_rotate(mr, mid_signs, mid_segs, mid_n_seg, PROD_MID_DIM);
+            ref_q8_0_roundtrip(mr, mr, (int)PROD_MID_DIM);
+            for (uint32_t r = 0; r < PROD_MID_DIM; r++)
+                mid[slot * PROD_MID_DIM + r] = mr[r];
+        }
+        for (uint32_t r = 0; r < PROD_OUT_DIM; r++) {
+            double acc = 0.0;
+            for (uint32_t slot = 0; slot < PROD_USED; slot++) {
+                const int32_t e = selected[t * PROD_USED + slot];
+                if (e < 0 || e >= (int32_t)PROD_EXPERTS) continue;
+                const uint8_t *drow = down + (uint64_t)e * down_expert +
+                                       (uint64_t)r * down_row;
+                const double *y = mid + (size_t)slot * PROD_MID_DIM;
+                for (uint32_t k = 0; k < PROD_MID_DIM; k++)
+                    acc += ref_pq2_0_value(drow, k) * y[k];
+            }
+            out[(size_t)t * PROD_OUT_DIM + r] = (float)acc;
+        }
+    }
+    free(mid); free(xr); free(mr);
+}
+
+static void run_pq2_rot_width_cases(void) {
+    /* Widths straddle the decode kernels (<=2), the wide-verify window,
+     * the MMA boundary at 8 and its 32/64-token shapes. */
+    static const uint32_t widths[] = { 1, 2, 3, 4, 8, 9, 16, 32, 33, 64, 96 };
+    enum { MAX_TOKENS = 96 };
+
+    const uint64_t gate_row = type_row_bytes(TYPE_PQ2_0, PROD_IN_DIM);
+    const uint64_t down_row = type_row_bytes(TYPE_PQ2_0, PROD_MID_DIM);
+    const uint64_t gate_slab_bytes =
+        (uint64_t)PROD_EXPERTS * PROD_MID_DIM * gate_row;
+    const uint64_t down_slab_bytes =
+        (uint64_t)PROD_EXPERTS * PROD_OUT_DIM * down_row;
+    const uint64_t image_bytes =
+        ALIGN64(gate_slab_bytes) * 2u + ALIGN64(down_slab_bytes);
+
+    uint8_t *image = mmap(NULL, image_bytes, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (image == MAP_FAILED) fail("pq2 image mmap");
+    for (uint64_t i = 0; i < image_bytes; i++) image[i] = (uint8_t)rng_u32();
+    const uint64_t gate_off = 0, up_off = ALIGN64(gate_slab_bytes),
+                   down_off = ALIGN64(gate_slab_bytes) * 2u;
+    for (uint64_t r = 0; r < (uint64_t)PROD_EXPERTS * PROD_MID_DIM; r++) {
+        prod_seed_row_scales(image + gate_off + r * gate_row,
+                             TYPE_PQ2_0, PROD_IN_DIM);
+        prod_seed_row_scales(image + up_off + r * gate_row,
+                             TYPE_PQ2_0, PROD_IN_DIM);
+    }
+    for (uint64_t r = 0; r < (uint64_t)PROD_EXPERTS * PROD_OUT_DIM; r++)
+        prod_seed_row_scales(image + down_off + r * down_row,
+                             TYPE_PQ2_0, PROD_MID_DIM);
+
+#if defined(__APPLE__)
+    require_ok(ds4_gpu_set_model_map_range(image, image_bytes, 0, image_bytes, 0),
+               "pq2 model map");
+#else
+    require_ok(ds4_gpu_set_model_map(image, image_bytes), "pq2 model map");
+#endif
+
+    const ds4_gpu_qwen4exp_slab gate_slab = {
+        image, image_bytes, gate_off,
+        (uint64_t)PROD_MID_DIM * gate_row, gate_row, TYPE_PQ2_0 };
+    const ds4_gpu_qwen4exp_slab up_slab = {
+        image, image_bytes, up_off,
+        (uint64_t)PROD_MID_DIM * gate_row, gate_row, TYPE_PQ2_0 };
+    const ds4_gpu_qwen4exp_slab down_slab = {
+        image, image_bytes, down_off,
+        (uint64_t)PROD_OUT_DIM * down_row, down_row, TYPE_PQ2_0 };
+
+    ds4_gpu_tensor *x_t = ds4_gpu_tensor_alloc(
+        (uint64_t)MAX_TOKENS * PROD_IN_DIM * sizeof(float));
+    ds4_gpu_tensor *sel_t = ds4_gpu_tensor_alloc(
+        (uint64_t)MAX_TOKENS * PROD_USED * sizeof(int32_t));
+    ds4_gpu_tensor *w_t = ds4_gpu_tensor_alloc(
+        (uint64_t)MAX_TOKENS * PROD_USED * sizeof(float));
+    ds4_gpu_tensor *mid_t = ds4_gpu_tensor_alloc(
+        (uint64_t)MAX_TOKENS * PROD_USED * PROD_MID_DIM * sizeof(float));
+    ds4_gpu_tensor *out_t = ds4_gpu_tensor_alloc(
+        (uint64_t)MAX_TOKENS * PROD_OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *part_t = ds4_gpu_tensor_alloc(
+        (uint64_t)MAX_TOKENS * PROD_USED * PROD_OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *in_sgn_t = ds4_gpu_tensor_alloc(
+        (uint64_t)PROD_IN_DIM * sizeof(float));
+    ds4_gpu_tensor *mid_sgn_t = ds4_gpu_tensor_alloc(
+        (uint64_t)PROD_MID_DIM * sizeof(float));
+    require_ok(x_t && sel_t && w_t && mid_t && out_t && part_t &&
+               in_sgn_t && mid_sgn_t, "pq2 rot tensor allocation");
+
+    float *in_signs = malloc((size_t)PROD_IN_DIM * sizeof(float));
+    float *mid_signs = malloc((size_t)PROD_MID_DIM * sizeof(float));
+    require_ok(in_signs && mid_signs, "pq2 sign allocation");
+    for (uint32_t k = 0; k < PROD_IN_DIM; k++)
+        in_signs[k] = (k % 37u < 18u) ? 1.0f : -1.0f;
+    for (uint32_t k = 0; k < PROD_MID_DIM; k++)
+        mid_signs[k] = (k % 23u < 11u) ? 1.0f : -1.0f;
+    require_ok(ds4_gpu_tensor_write(in_sgn_t, 0, in_signs,
+                                    (uint64_t)PROD_IN_DIM * sizeof(float)),
+               "pq2 in sign upload");
+    require_ok(ds4_gpu_tensor_write(mid_sgn_t, 0, mid_signs,
+                                    (uint64_t)PROD_MID_DIM * sizeof(float)),
+               "pq2 mid sign upload");
+
+    /* Power-of-two segments, each a multiple of 128, covering the row:
+     * 2560 = 1024 + 1024 + 512 on the input (segments are capped at
+     * QW_LBF_ROT_THREADS*4 = 1024), 640 = 512 + 128 on the mid. */
+    const uint32_t in_segs[3]  = { 1024, 1024, 512 };
+    const uint32_t mid_segs[2] = { 512, 128 };
+    ds4_gpu_qwen4exp_rot rot;
+    memset(&rot, 0, sizeof(rot));
+    rot.in.signs  = (const float *)ds4_gpu_tensor_contents(in_sgn_t);
+    rot.in.width  = PROD_IN_DIM;
+    rot.in.n_seg  = 3;
+    rot.in.seg_size[0] = in_segs[0];
+    rot.in.seg_size[1] = in_segs[1];
+    rot.in.seg_size[2] = in_segs[2];
+    rot.mid.signs = (const float *)ds4_gpu_tensor_contents(mid_sgn_t);
+    rot.mid.width = PROD_MID_DIM;
+    rot.mid.n_seg = 2;
+    rot.mid.seg_size[0] = mid_segs[0];
+    rot.mid.seg_size[1] = mid_segs[1];
+
+    float *x = malloc((size_t)MAX_TOKENS * PROD_IN_DIM * sizeof(float));
+    int32_t *sel = malloc((size_t)MAX_TOKENS * PROD_USED * sizeof(int32_t));
+    float *wts = malloc((size_t)MAX_TOKENS * PROD_USED * sizeof(float));
+    float *got = malloc((size_t)MAX_TOKENS * PROD_OUT_DIM * sizeof(float));
+    float *exp = malloc((size_t)MAX_TOKENS * PROD_OUT_DIM * sizeof(float));
+    require_ok(x && sel && wts && got && exp, "pq2 rot host buffers");
+    for (size_t i = 0; i < (size_t)MAX_TOKENS * PROD_IN_DIM; i++)
+        x[i] = rng_unit() * 0.02f;
+    for (size_t i = 0; i < (size_t)MAX_TOKENS * PROD_USED; i++) {
+        sel[i] = (int32_t)((i * 7u + 3u) % PROD_EXPERTS);
+        wts[i] = (float)((i % PROD_USED) + 1u) * 0.25f;
+    }
+    require_ok(ds4_gpu_tensor_write(sel_t, 0, sel,
+            (uint64_t)MAX_TOKENS * PROD_USED * sizeof(int32_t)),
+               "pq2 selected write");
+    require_ok(ds4_gpu_tensor_write(w_t, 0, wts,
+            (uint64_t)MAX_TOKENS * PROD_USED * sizeof(float)),
+               "pq2 weights write");
+
+    const uint64_t out_n_bytes =
+        (uint64_t)MAX_TOKENS * PROD_OUT_DIM * sizeof(float);
+
+    for (size_t wi = 0; wi < sizeof(widths) / sizeof(widths[0]); wi++) {
+        const uint32_t w = widths[wi];
+        require_ok(ds4_gpu_tensor_write(
+                       x_t, 0, x, (uint64_t)w * PROD_IN_DIM * sizeof(float)),
+                   "pq2 activation write");
+
+        /* Arm A: both rotations live. */
+        memset(got, 0xab, out_n_bytes);
+        require_ok(ds4_gpu_qwen4exp_routed_moe_router_rot_tensor(
+                       out_t, mid_t, part_t,
+                       &gate_slab, &up_slab, &down_slab,
+                       PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM,
+                       sel_t, w_t, PROD_EXPERTS, PROD_USED,
+                       x_t, w, PROD_USED * PROD_MID_DIM,
+                       NULL, NULL, &rot),
+                   "pq2 rotated routed MoE");
+        require_ok(ds4_gpu_tensor_read(out_t, 0, got, out_n_bytes),
+                   "pq2 rot output read");
+        pq2_rot_reference(image + gate_off, image + up_off,
+                          image + down_off, w, sel, wts, x,
+                          in_signs, in_segs, 3, mid_signs, mid_segs, 2, exp);
+        {
+            const double err = rel_frobenius(got, exp,
+                (size_t)w * PROD_OUT_DIM);
+            printf("pq2_0 rotated routed MoE at %u tokens: rel Frobenius %.3e\n",
+                   w, err);
+            if (!(err <= 2e-2))
+                fail("pq2_0 rotated MoE outside the section 2 band");
+        }
+
+        /* Negative control: the same device run against an oracle whose
+         * mid rotation carries one flipped sign.  If the device skipped
+         * rot->mid the oracle would match and this must NOT be within
+         * the band -- a flip that still fits proves nothing. */
+        {
+            float *bad_signs = malloc((size_t)PROD_MID_DIM * sizeof(float));
+            require_ok(bad_signs != NULL, "pq2 flipped sign alloc");
+            memcpy(bad_signs, mid_signs,
+                   (size_t)PROD_MID_DIM * sizeof(float));
+            bad_signs[37] = -bad_signs[37];
+            pq2_rot_reference(image + gate_off, image + up_off,
+                              image + down_off, w, sel, wts, x,
+                              in_signs, in_segs, 3,
+                              bad_signs, mid_segs, 2, exp);
+            const double ctrl = rel_frobenius(got, exp,
+                (size_t)w * PROD_OUT_DIM);
+            free(bad_signs);
+            if (ctrl <= 2e-2)
+                fail("pq2_0 rot control: one flipped mid sign stayed in band");
+            printf("  negative control (flipped mid sign): %.3e, out of band\n",
+                   ctrl);
+        }
+
+        /* Arm B: no rotation -- NULL rot must run the identical launches,
+         * so this also covers the plain PQ2_0 path at every width. */
+        memset(got, 0xab, out_n_bytes);
+        require_ok(ds4_gpu_qwen4exp_routed_moe_router_rot_tensor(
+                       out_t, mid_t, part_t,
+                       &gate_slab, &up_slab, &down_slab,
+                       PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM,
+                       sel_t, w_t, PROD_EXPERTS, PROD_USED,
+                       x_t, w, PROD_USED * PROD_MID_DIM,
+                       NULL, NULL, NULL),
+                   "pq2 unrotated routed MoE");
+        require_ok(ds4_gpu_tensor_read(out_t, 0, got, out_n_bytes),
+                   "pq2 plain output read");
+        pq2_rot_reference(image + gate_off, image + up_off,
+                          image + down_off, w, sel, wts, x,
+                          NULL, NULL, 0, NULL, NULL, 0, exp);
+        {
+            const double err = rel_frobenius(got, exp,
+                (size_t)w * PROD_OUT_DIM);
+            printf("pq2_0 plain routed MoE at %u tokens: rel Frobenius %.3e\n",
+                   w, err);
+            if (!(err <= 2e-2))
+                fail("pq2_0 unrotated MoE outside the section 2 band");
+        }
+    }
+
+    free(x); free(sel); free(wts); free(got); free(exp);
+    free(in_signs); free(mid_signs);
+    ds4_gpu_tensor_free(x_t); ds4_gpu_tensor_free(sel_t);
+    ds4_gpu_tensor_free(w_t); ds4_gpu_tensor_free(mid_t);
+    ds4_gpu_tensor_free(out_t); ds4_gpu_tensor_free(part_t);
+    ds4_gpu_tensor_free(in_sgn_t); ds4_gpu_tensor_free(mid_sgn_t);
+    munmap(image, image_bytes);
+}
 /* ------------------------------------------------------------------ */
 /* The staged shared expert against the per-row shared expert.
  *
@@ -1854,8 +2214,8 @@ static void run_production_expert_cases(void) {
     const uint32_t n_down = (uint32_t)(sizeof(PROD_DOWN_TYPES) /
                                        sizeof(PROD_DOWN_TYPES[0]));
 
-    uint64_t gate_off[4], up_off[4], down_off[2];
-    uint64_t gate_slab_bytes[4], down_slab_bytes[2];
+    uint64_t gate_off[5], up_off[5], down_off[3];
+    uint64_t gate_slab_bytes[5], down_slab_bytes[3];
     uint64_t cursor = 0;
     for (uint32_t i = 0; i < n_gate_up; i++) {
         gate_slab_bytes[i] = (uint64_t)PROD_EXPERTS * PROD_MID_DIM *
@@ -1965,13 +2325,15 @@ static void run_production_expert_cases(void) {
     /* Every distinct pair the measured tables name, once. */
     uint32_t seen[16][2];
     uint32_t n_seen = 0;
-    const expert_type_row *tables[2] = { UD_Q4_K_XL_EXPERT_TYPES,
-                                         OTHER_RECIPE_EXPERT_TYPES };
-    const uint32_t counts[2] = {
+    const expert_type_row *tables[3] = { UD_Q4_K_XL_EXPERT_TYPES,
+                                         OTHER_RECIPE_EXPERT_TYPES,
+                                         LBF_PQ2_EXPERT_TYPES };
+    const uint32_t counts[3] = {
         (uint32_t)(sizeof(UD_Q4_K_XL_EXPERT_TYPES) / sizeof(expert_type_row)),
         (uint32_t)(sizeof(OTHER_RECIPE_EXPERT_TYPES) / sizeof(expert_type_row)),
+        (uint32_t)(sizeof(LBF_PQ2_EXPERT_TYPES) / sizeof(expert_type_row)),
     };
-    for (uint32_t tbl = 0; tbl < 2; tbl++) {
+    for (uint32_t tbl = 0; tbl < 3; tbl++) {
         for (uint32_t r = 0; r < counts[tbl]; r++) {
             const expert_type_row row = tables[tbl][r];
             bool known = false;
@@ -2964,6 +3326,7 @@ int main(int argc, char **argv) {
     run_group_scan_boundary_cases();
 
     run_production_expert_cases();
+    run_pq2_rot_width_cases();
     run_shared_exact_case(PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM);
     run_shared_exact_case(1056, 1056, 19);
     run_shared_exact_case(32, 32, 17);
