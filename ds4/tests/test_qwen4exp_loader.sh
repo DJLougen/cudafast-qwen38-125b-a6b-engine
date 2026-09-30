@@ -43,6 +43,15 @@ gen badtype   --retype-tensor blk.0.attn_qkv.weight=Q4_K
 gen badshape  --reshape-tensor blk.0.attn_gate.weight=2560,6100
 gen badple    --reshape-tensor per_layer_token_embd.weight=128,200000
 
+# run2's table: the n-gram table retyped to Q8_0 (34-byte rows).  Must bind
+# the same way the IQ4_NL one does.
+gen ple_q8 --retype-tensor per_layer_token_embd.weight=Q8_0
+
+# A table type the loader binds but the SSD reader cannot gather: F16 binds
+# (the bind list includes it for sidecar artifacts) and must be refused by
+# ds4_ple_table_open, which only dequantizes IQ4_NL and Q8_0.
+gen ple_f16 --retype-tensor per_layer_token_embd.weight=F16
+
 # Metadata that disagrees with the fixture geometry baked into the shape preset.
 gen badkv_hc        --kv-set qwen4exp.hyper_connection.low_rank=U32:256
 gen badkv_experts   --kv-set qwen4exp.expert_count=U32:256

@@ -67,14 +67,19 @@ def main():
     path, reader, tensor = find_tensor(gguf, args.shards, args.tensor)
 
     qtype = tensor.tensor_type
-    if qtype != gguf.GGMLQuantizationType.IQ4_NL:
-        sys.exit("this check covers IQ4_NL only; the table is %s" % qtype.name)
-
-    # IQ4_NL: 32 values per block, one f16 scale plus 16 packed bytes.
-    block_elems, block_bytes = 32, 18
+    if qtype == gguf.GGMLQuantizationType.Q8_0:
+        # Q8_0: 32 values per block, one f16 scale plus 32 int8 payloads.
+        block_elems, block_bytes = 32, 34
+    elif qtype == gguf.GGMLQuantizationType.IQ4_NL:
+        # IQ4_NL: 32 values per block, one f16 scale plus 16 packed bytes.
+        block_elems, block_bytes = 32, 18
+    else:
+        sys.exit("this check covers IQ4_NL and Q8_0; the table is %s"
+                 % qtype.name)
     row_dim = int(tensor.shape[0])
     if row_dim % block_elems:
-        sys.exit("row_dim %d is not a whole number of IQ4_NL blocks" % row_dim)
+        sys.exit("row_dim %d is not a whole number of %s blocks"
+                 % (row_dim, qtype.name))
     row_bytes = row_dim // block_elems * block_bytes
     rows_in_table = int(tensor.shape[1])
 
