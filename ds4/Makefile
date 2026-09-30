@@ -545,6 +545,18 @@ $(QWEN4EXP_MOE_TEST): tests/test_qwen4exp_moe.o $(GPU_TEST_OBJS)
 .PHONY: test-qwen4exp-moe
 test-qwen4exp-moe: $(QWEN4EXP_MOE_TEST)
 	./$(QWEN4EXP_MOE_TEST)
+# lowbitFlash rotation+quantise kernel vs a byte-exact host oracle, with
+# flipped-sign negative controls and refused malformed specs.  Runs the
+# real kernel on CUDA hosts.
+.PHONY: test-qwen4exp-lbf-rot
+tests/test_qwen4exp_lbf_rot.o: tests/test_qwen4exp_lbf_rot.c ds4_gpu.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ tests/test_qwen4exp_lbf_rot.c
+
+tests/test_qwen4exp_lbf_rot: tests/test_qwen4exp_lbf_rot.o $(GPU_TEST_OBJS)
+	$(GPU_TEST_LINK)
+
+test-qwen4exp-lbf-rot: tests/test_qwen4exp_lbf_rot
+	./tests/test_qwen4exp_lbf_rot
 
 # The gate/up MMA tile's q4_K staging valve, A/B: DS4_QWEN4EXP_NO_GATEUP_DQ
 # set and unset must produce identical bytes through the complete routed MoE,
