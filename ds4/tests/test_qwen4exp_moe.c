@@ -2159,6 +2159,8 @@ static void run_moe_input_reuse_case(
                            "reuse complete eager output/canaries");
             }
             eager++;
+            fprintf(stderr, "DBG reuse w=%u pat=%u eager done\n", c.rows, pattern);
+            fflush(stderr);
 #if !defined(__APPLE__) && !defined(__HIP_PLATFORM_AMD__)
             /* The activation quantiser's one-warp kernel against the
              * eight-warp prefill kernel the chain above used at rows >= 64
