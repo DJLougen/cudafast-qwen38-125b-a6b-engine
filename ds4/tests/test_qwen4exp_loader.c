@@ -19,6 +19,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+
+#include "ds4_qwen4exp_ple.h"
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #endif
@@ -56,6 +58,24 @@ void ds4_qwen4exp_test_rot_masks(const char *path, uint64_t *gate_up_out,
 
 static int g_failures;
 static int g_checks;
+
+/* Minimal IEEE half to float, for the PLE Q8_0 byte decode below. */
+static float ple_test_f16(uint16_t h) {
+    const uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    const uint32_t exp = (h >> 10) & 0x1fu;
+    const uint32_t man = h & 0x3ffu;
+    union { uint32_t u; float f; } bits;
+    if (exp == 0) {
+        if (man == 0) { bits.u = sign; return bits.f; }
+        union { uint32_t u; float f; } base;
+        bits.u = sign | 0x38800000u | (man << 13);
+        base.u = sign | 0x38800000u;
+        return bits.f - base.f;
+    }
+    if (exp == 31) { bits.u = sign | 0x7f800000u | (man << 13); return bits.f; }
+    bits.u = sign | ((exp + 112u) << 23) | (man << 13);
+    return bits.f;
+}
 
 static void check(bool ok, const char *what) {
     g_checks++;
@@ -421,6 +441,76 @@ int main(int argc, char **argv) {
     join(p, sizeof(p), dir, "badrot_oneside/"); strcat(p, shard1);
     run_child(p, "rotated together", true, -1,
               "gate/up-only coverage is refused");
+
+    /* ---------------------------------------------------------------- */
+    printf("PLE TABLE: Q8_0 rows bind, open and dequantize\n");
+
+    /* ple_q8 binds through the loader like the IQ4_NL fixture does. */
+    join(p, sizeof(p), dir, "ple_q8/"); strcat(p, shard1);
+    run_child(p, "q8_0, 170 B/row", false, -1,
+              "Q8_0 PLE fixture binds completely");
+
+    /* The SSD table reader opens the Q8_0 table, reports 34-byte blocks
+     * (160 values = 5 blocks = 170 B/row), and dequantizes a row to the
+     * values an independent decode of the same bytes produces. */
+    {
+        const char *shards[3];
+        char q8p[3][4096];
+        for (int s = 0; s < 3; s++) {
+            snprintf(q8p[s], sizeof(q8p[s]),
+                     "%sple_q8/qw4x-0000%d-of-00003.gguf", dir, s + 1);
+            shards[s] = q8p[s];
+        }
+        char perr[DS4_PLE_ERROR_SIZE];
+        ds4_ple_table *pt = NULL;
+        check(ds4_ple_table_open(shards, 3, 0, &pt, perr, sizeof(perr)),
+              "ds4_ple_table_open accepts the Q8_0 table");
+        if (pt) {
+            check_eq_u64(ds4_ple_table_quant_row_bytes(pt), 170ull,
+                         "Q8_0 PLE row is 5 x 34 B");
+            uint8_t raw[170];
+            float vals[160];
+            check(ds4_ple_table_quant_row(pt, 0, raw),
+                  "Q8_0 PLE row 0 reads");
+            check(ds4_ple_table_rows(pt, (uint64_t[]){0}, 1, vals),
+                  "Q8_0 PLE row 0 dequantizes");
+            const float d = ple_test_f16(raw[0] | ((uint16_t)raw[1] << 8));
+            check(vals[0] == d * (float)(int8_t)raw[2],
+                  "Q8_0 PLE element 0 matches the byte decode");
+            ds4_ple_table_close(pt);
+        }
+
+        /* The IQ4_NL control still opens with 90-byte rows. */
+        char gp[3][4096];
+        for (int s = 0; s < 3; s++) {
+            snprintf(gp[s], sizeof(gp[s]),
+                     "%sgood/qw4x-0000%d-of-00003.gguf", dir, s + 1);
+            shards[s] = gp[s];
+        }
+        pt = NULL;
+        check(ds4_ple_table_open(shards, 3, 0, &pt, perr, sizeof(perr)),
+              "ds4_ple_table_open still accepts IQ4_NL");
+        if (pt) {
+            check_eq_u64(ds4_ple_table_quant_row_bytes(pt), 90ull,
+                         "IQ4_NL PLE row is 5 x 18 B");
+            ds4_ple_table_close(pt);
+        }
+
+        /* Negative control: an F16 table binds at load time but the SSD
+         * reader refuses it -- gather would emit silently wrong rows
+         * otherwise. */
+        char fp[3][4096];
+        for (int s = 0; s < 3; s++) {
+            snprintf(fp[s], sizeof(fp[s]),
+                     "%sple_f16/qw4x-0000%d-of-00003.gguf", dir, s + 1);
+            shards[s] = fp[s];
+        }
+        pt = NULL;
+        perr[0] = '\0';
+        check(!ds4_ple_table_open(shards, 3, 0, &pt, perr, sizeof(perr)) &&
+              strstr(perr, "expected"),
+              "ds4_ple_table_open refuses the F16 table by name");
+    }
 
     /* ---------------------------------------------------------------- */
     printf("MEMORY SAFETY: refuse when free memory cannot hold the model\n");
