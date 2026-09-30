@@ -1405,7 +1405,18 @@ static void qwen4exp_bind_lbf_rotations(ds4_qwen4exp_weights *w,
                          "lowbitflash.rot.version is missing");
         }
     }
-    if (!has_version) return;
+
+    /* The spec tables stay empty when no rotation metadata is present; the
+     * attach-and-coverage loop below still runs, because a PQ2_0 expert
+     * tensor WITHOUT a spec is itself a malformed artifact -- the weights
+     * are stored in a rotated basis and cannot run unrotated. */
+    qw_rot_slot *gu = calloc(w->n_layer, sizeof(*gu));
+    qw_rot_slot *dn = calloc(w->n_layer, sizeof(*dn));
+    if (!gu || !dn) {
+        qwen4exp_die("out of memory parsing lowbitflash.rot");
+    }
+
+    if (has_version) {
     if (version != QW_ROT_VERSION) {
         qwen4exp_die("unsupported lowbitflash.rot.version: %u (this build "
                      "implements %u)", version, QW_ROT_VERSION);
@@ -1426,12 +1437,6 @@ static void qwen4exp_bind_lbf_rotations(ds4_qwen4exp_weights *w,
         qwen4exp_die("lowbitflash.rot.weight_names holds %" PRIu64
                      " entries, more than the %u fused expert tensors this "
                      "shape can name", names.len, w->n_layer * 3u);
-    }
-
-    qw_rot_slot *gu = calloc(w->n_layer, sizeof(*gu));
-    qw_rot_slot *dn = calloc(w->n_layer, sizeof(*dn));
-    if (!gu || !dn) {
-        qwen4exp_die("out of memory parsing lowbitflash.rot");
     }
 
     ds4_cursor c = cursor_at(m, names.data_pos);
@@ -1468,6 +1473,7 @@ static void qwen4exp_bind_lbf_rotations(ds4_qwen4exp_weights *w,
             }
         }
     }
+    } /* has_version: gu/dn stay zeroed when the artifact carries none */
 
     /* Attach, then the closed-world check: every bound expert tensor that
      * is PQ2_0 must be covered by the spec it claims. */
@@ -1661,6 +1667,36 @@ void ds4_qwen4exp_test_open(const char *path,
     if (n_shards_out) *n_shards_out = model.n_shards;
     if (n_tensors_out) *n_tensors_out = model.n_tensors;
 
+    model_close(&model);
+}
+
+/* Rotation attach probe for the loader test: after a bind, one bit per
+ * layer per side saying a spec was attached.  bit il set in *gate_up_out /
+ * *down_out means that side of layer il carries a live rotation spec. */
+void ds4_qwen4exp_test_rot_masks(const char *path,
+                                 uint64_t *gate_up_out,
+                                 uint64_t *down_out,
+                                 int      *has_rot_out) {
+    static ds4_model model;
+    static ds4_qwen4exp_weights weights;
+
+    model_open(&model, path, false, false);
+    ds4_str arch = {0};
+    if (!model_get_string(&model, "general.architecture", &arch) ||
+        !ds4_streq(arch, "qwen4exp")) {
+        qwen4exp_die("general.architecture is not qwen4exp");
+    }
+    config_validate_qwen4exp_model(&model);
+    weights_bind_qwen4exp(&weights, &model);
+
+    uint64_t gu = 0, dn = 0;
+    for (uint32_t il = 0; il < weights.n_layer && il < 64u; il++) {
+        if (weights.layer[il].rot_gate_up.present) gu |= 1ull << il;
+        if (weights.layer[il].rot_down.present)    dn |= 1ull << il;
+    }
+    if (gate_up_out) *gate_up_out = gu;
+    if (down_out)    *down_out = dn;
+    if (has_rot_out) *has_rot_out = weights.has_lbf_rot ? 1 : 0;
     model_close(&model);
 }
 

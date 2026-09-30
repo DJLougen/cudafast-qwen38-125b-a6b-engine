@@ -72,6 +72,62 @@ gen badkv_ple_rows --kv-set-array "qwen4exp.ple.head_vocab_sizes=U64:$OVERRUN"
 
 # The recorded attention schedule must match the interval rule.
 gen badkv_schedule --kv-set-array qwen4exp.attention.compress_ratios=I32:4,0,0,4
+# lowbitflash.rot.*: the rotated-basis metadata a PQ2_0 model carries.  The
+# sign/blocks arrays are generated per case; gate and up MUST name identical
+# specs (the shared input is rotated once for both).
+SIGNS_2560=$("$PY" - <<'PYEOF'
+import random
+r = random.Random(20260930)
+print(",".join(str(r.choice([-1, 1])) for _ in range(2560)))
+PYEOF
+)
+SIGNS_640=$("$PY" - <<'PYEOF'
+import random
+r = random.Random(20260930)
+print(",".join(str(r.choice([-1, 1])) for _ in range(640)))
+PYEOF
+)
+BLOCKS_2560="1024,1024,512"
+BLOCKS_640="512,128"
+GU_NAMES="blk.0.ffn_gate_exps.weight,blk.0.ffn_up_exps.weight"
+DN_NAME="blk.0.ffn_down_exps.weight"
+
+# Positive: blk.0 experts retyped to PQ2_0 and fully covered by specs.  The
+# bind must succeed, attach the specs, and refuse nothing else.
+gen rot_ok \
+    --retype-tensor blk.0.ffn_gate_exps.weight=PQ2_0 \
+    --retype-tensor blk.0.ffn_up_exps.weight=PQ2_0 \
+    --retype-tensor blk.0.ffn_down_exps.weight=PQ2_0 \
+    --kv-set lowbitflash.rot.version=U32:1 \
+    --kv-set-array "lowbitflash.rot.weight_names=STR:$GU_NAMES,$DN_NAME" \
+    --kv-set-array "lowbitflash.rot.blocks.blk.0.ffn_gate_exps.weight=I32:$BLOCKS_2560" \
+    --kv-set-array "lowbitflash.rot.blocks.blk.0.ffn_up_exps.weight=I32:$BLOCKS_2560" \
+    --kv-set-array "lowbitflash.rot.blocks.blk.0.ffn_down_exps.weight=I32:$BLOCKS_640" \
+    --kv-set-array "lowbitflash.rot.signs.blk.0.ffn_gate_exps.weight=I32:$SIGNS_2560" \
+    --kv-set-array "lowbitflash.rot.signs.blk.0.ffn_up_exps.weight=I32:$SIGNS_2560" \
+    --kv-set-array "lowbitflash.rot.signs.blk.0.ffn_down_exps.weight=I32:$SIGNS_640"
+
+# Negative controls: each breaks one rule and must die by name.
+gen badrot_version --kv-set lowbitflash.rot.version=U32:2 \
+    --kv-set-array "lowbitflash.rot.weight_names=STR:$GU_NAMES"
+gen badrot_keyonly --kv-set lowbitflash.rot.present=U32:1
+gen badrot_name \
+    --kv-set lowbitflash.rot.version=U32:1 \
+    --kv-set-array "lowbitflash.rot.weight_names=STR:blk.0.attn_qkv.weight" \
+    --kv-set-array "lowbitflash.rot.blocks.blk.0.attn_qkv.weight=I32:$BLOCKS_2560" \
+    --kv-set-array "lowbitflash.rot.signs.blk.0.attn_qkv.weight=I32:$SIGNS_2560"
+gen badrot_nospec \
+    --retype-tensor blk.0.ffn_down_exps.weight=PQ2_0
+gen badrot_oneside \
+    --retype-tensor blk.0.ffn_gate_exps.weight=PQ2_0 \
+    --retype-tensor blk.0.ffn_up_exps.weight=PQ2_0 \
+    --retype-tensor blk.0.ffn_down_exps.weight=PQ2_0 \
+    --kv-set lowbitflash.rot.version=U32:1 \
+    --kv-set-array "lowbitflash.rot.weight_names=STR:$GU_NAMES" \
+    --kv-set-array "lowbitflash.rot.blocks.blk.0.ffn_gate_exps.weight=I32:$BLOCKS_2560" \
+    --kv-set-array "lowbitflash.rot.blocks.blk.0.ffn_up_exps.weight=I32:$BLOCKS_2560" \
+    --kv-set-array "lowbitflash.rot.signs.blk.0.ffn_gate_exps.weight=I32:$SIGNS_2560" \
+    --kv-set-array "lowbitflash.rot.signs.blk.0.ffn_up_exps.weight=I32:$SIGNS_2560"
 
 echo
 "$BIN" "$DIR"
