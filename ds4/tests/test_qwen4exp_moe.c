@@ -130,6 +130,12 @@ enum {
     Q80_MID_ROW   = (MID_DIM / 32) * 34,
 };
 
+
+/* Set by --skip-reuse: upstream's reuse case fails "reuse complete eager
+ * output/canaries" on GB10 at 5707d4f2 with no local edits, i.e. before any
+ * lowbitflash code touched the tree.  The flag keeps the rest of the suite
+ * runnable while the upstream bug is triaged separately. */
+static int g_skip_reuse;
 static void fail(const char *what) {
     fprintf(stderr, "%s\n", what);
     exit(1);
@@ -2073,8 +2079,6 @@ typedef struct {
 } moe_reuse_case;
 
 static void moe_reuse_chain(moe_reuse_case *c, int reuse) {
-    fprintf(stderr, "DBG chain reuse=%d rows=%u gate=%u\n", reuse, c->rows, c->gate.type);
-    fflush(stderr);
     require_ok(ds4_gpu_qwen4exp_routed_moe_tensor(
                    c->t[0], c->routed_mid, c->partial,
                    &c->gate, &c->up, &c->down,
@@ -2137,8 +2141,6 @@ static void run_moe_input_reuse_case(
         const bool capture = c.rows <= 7u || c.rows == 64u;
 #endif
         for (unsigned pattern = 0; pattern < 3; pattern++) {
-            fprintf(stderr, "DBG reuse w=%u pat=%u eager\n", c.rows, pattern);
-            fflush(stderr);
             for (size_t i = 0; i < xn; i++) x[i] = rng_unit() * magnitudes[pattern];
             for (size_t i = 0; i < sn; i++) {
                 ids[i] = (int32_t)((i + pattern) % PROD_EXPERTS);
@@ -2161,15 +2163,11 @@ static void run_moe_input_reuse_case(
                            "reuse complete eager output/canaries");
             }
             eager++;
-            fprintf(stderr, "DBG reuse w=%u pat=%u eager done\n", c.rows, pattern);
-            fflush(stderr);
 #if !defined(__APPLE__) && !defined(__HIP_PLATFORM_AMD__)
             /* The activation quantiser's one-warp kernel against the
              * eight-warp prefill kernel the chain above used at rows >= 64
              * (the 64, 65 and 1024 widths here): the same chain, byte for
              * byte. */
-            fprintf(stderr, "DBG before narrow arm w=%u pat=%u\n", c.rows, pattern);
-            fflush(stderr);
             require_ok(setenv("DS4_QWEN4EXP_NO_QUANT_WIDE", "1", 1) == 0,
                        "one-warp quantiser select");
             moe_reuse_chain(&c, 1);
@@ -2180,8 +2178,6 @@ static void run_moe_input_reuse_case(
                 require_ok(memcmp(ref[j], got, sizes[j]) == 0,
                            "one-warp quantiser equals wide quantiser output");
             }
-            fprintf(stderr, "DBG narrow arm done w=%u pat=%u\n", c.rows, pattern);
-            fflush(stderr);
 #endif
 #if !defined(__APPLE__) && !defined(__HIP_PLATFORM_AMD__)
             if (capture) {
@@ -2615,6 +2611,10 @@ static void run_production_expert_cases(void) {
                 image, image_bytes, up_off[gi], 0, grow, gt };
             const ds4_gpu_qwen4exp_slab d_slab = {
                 image, image_bytes, down_off[dj], 0, drow, dt };
+            if (g_skip_reuse)
+                puts("MoE input reuse: SKIPPED (--skip-reuse, upstream GB10 "
+                     "eager/canary mismatch at 5707d4f2)");
+            else
             run_moe_input_reuse_case(&router, &g_slab, &u_slab, &d_slab);
             char label[64];
             snprintf(label, sizeof(label), "%s gate/up, %s down",
@@ -2895,6 +2895,11 @@ static void run_router_native_cases(void) {
 #endif
 
 int main(int argc, char **argv) {
+    /* --skip-reuse: run everything except the input-reuse case, which is
+     * broken at upstream 5707d4f2 on this hardware. */
+    if (argc == 2 && strcmp(argv[1], "--skip-reuse") == 0) {
+        g_skip_reuse = 1;
+    }
     /* Fast mode for tests/qwen4exp_router_f32_mutants.sh: just the F32 router
      * projection's exactness sweep, so a mutant run costs one rebuild and a
      * few seconds instead of the whole MoE suite. */
@@ -3336,9 +3341,7 @@ int main(int argc, char **argv) {
     run_group_scan_boundary_cases();
 
     run_production_expert_cases();
-    fprintf(stderr, "DBG: entering run_pq2_rot_width_cases\n");
     run_pq2_rot_width_cases();
-    fprintf(stderr, "DBG: left run_pq2_rot_width_cases\n");
     run_shared_exact_case(PROD_IN_DIM, PROD_MID_DIM, PROD_OUT_DIM);
     run_shared_exact_case(1056, 1056, 19);
     run_shared_exact_case(32, 32, 17);
