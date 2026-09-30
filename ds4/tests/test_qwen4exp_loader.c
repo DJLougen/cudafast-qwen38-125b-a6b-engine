@@ -458,7 +458,7 @@ int main(int argc, char **argv) {
         char q8p[3][4096];
         for (int s = 0; s < 3; s++) {
             snprintf(q8p[s], sizeof(q8p[s]),
-                     "%sple_q8/qw4x-0000%d-of-00003.gguf", dir, s + 1);
+                     "%s/ple_q8/qw4x-0000%d-of-00003.gguf", dir, s + 1);
             shards[s] = q8p[s];
         }
         char perr[DS4_PLE_ERROR_SIZE];
@@ -484,7 +484,7 @@ int main(int argc, char **argv) {
         char gp[3][4096];
         for (int s = 0; s < 3; s++) {
             snprintf(gp[s], sizeof(gp[s]),
-                     "%sgood/qw4x-0000%d-of-00003.gguf", dir, s + 1);
+                     "%s/good/qw4x-0000%d-of-00003.gguf", dir, s + 1);
             shards[s] = gp[s];
         }
         pt = NULL;
@@ -502,7 +502,7 @@ int main(int argc, char **argv) {
         char fp[3][4096];
         for (int s = 0; s < 3; s++) {
             snprintf(fp[s], sizeof(fp[s]),
-                     "%sple_f16/qw4x-0000%d-of-00003.gguf", dir, s + 1);
+                     "%s/ple_f16/qw4x-0000%d-of-00003.gguf", dir, s + 1);
             shards[s] = fp[s];
         }
         pt = NULL;
