@@ -94,6 +94,17 @@ static double ref_q6_K_value(const uint8_t *block, uint32_t k) {
     return (double)d * (double)sc * (double)((int32_t)q - 32);
 }
 
+/* prism block_pq2_0: 128 two-bit codes in 32 payload bytes behind one f16
+ * scale; element j is payload byte j/4, bits 2*(j%4), value (code-1)*d.
+ * Written against the byte layout, per dequantize_row_pq2_0(). */
+static double ref_pq2_0_value(const uint8_t *block, uint32_t k) {
+    const uint8_t *xb = block + (k / 128u) * 34u;
+    const float d = dev_f16_to_f32((uint16_t)(xb[0] | ((uint16_t)xb[1] << 8)));
+    const uint32_t j = k % 128u;
+    const int32_t code = (xb[2u + (j >> 2u)] >> (2u * (j & 3u))) & 3u;
+    return (double)(code - 1) * (double)d;
+}
+
 /* ---------------------------------------------------------------- */
 
 static uint64_t rng_state = 0x243f6a8885a308d3ull;
@@ -125,6 +136,7 @@ enum { SUPERBLOCKS = 3, TRIALS = 200 };
 
 int main(void) {
     uint8_t b5[176 * SUPERBLOCKS];
+    uint8_t bp[34 * SUPERBLOCKS];
     uint8_t b6[210 * SUPERBLOCKS];
     int mismatches = 0;
 
@@ -168,18 +180,22 @@ int main(void) {
     for (int trial = 0; trial < TRIALS; trial++) {
         for (size_t i = 0; i < sizeof(b5); i++) b5[i] = (uint8_t)rng_u32();
         for (size_t i = 0; i < sizeof(b6); i++) b6[i] = (uint8_t)rng_u32();
+        for (size_t i = 0; i < sizeof(bp); i++) bp[i] = (uint8_t)rng_u32();
         /* Only the f16 scales are constrained, so the packed payload, the
          * six-bit scale/min pairs and the int8 scales stay fully random. */
         for (int b = 0; b < SUPERBLOCKS; b++) {
             const uint16_t d5 = rng_half_scale();
             const uint16_t m5 = rng_half_scale();
             const uint16_t d6 = rng_half_scale();
+            const uint16_t dp = rng_half_scale();
             b5[b * 176 + 0] = (uint8_t)(d5 & 0xff);
             b5[b * 176 + 1] = (uint8_t)(d5 >> 8);
             b5[b * 176 + 2] = (uint8_t)(m5 & 0xff);
             b5[b * 176 + 3] = (uint8_t)(m5 >> 8);
             b6[b * 210 + 208] = (uint8_t)(d6 & 0xff);
             b6[b * 210 + 209] = (uint8_t)(d6 >> 8);
+            bp[b * 34 + 0] = (uint8_t)(dp & 0xff);
+            bp[b * 34 + 1] = (uint8_t)(dp >> 8);
         }
         for (uint32_t k = 0; k < 256u * SUPERBLOCKS; k++) {
             const double cuda5 = dev_qwen4exp_q5_K_value((const char *)b5, k);
@@ -199,6 +215,16 @@ int main(void) {
                 }
             }
         }
+        for (uint32_t k = 0; k < 128u * SUPERBLOCKS; k++) {
+            const double cudap = dev_qwen4exp_pq2_0_value((const char *)bp, k);
+            const double refp = ref_pq2_0_value(bp, k);
+            if (cudap != refp) {
+                if (mismatches++ < 5) {
+                    printf("pq2_0 element %u: CUDA %.9g, reference %.9g\n",
+                           k, cudap, refp);
+                }
+            }
+        }
     }
 
     if (mismatches != 0) {
@@ -206,7 +232,7 @@ int main(void) {
         return 1;
     }
     printf("qwen4exp CUDA MoE parity: PASS "
-           "(%d rows x %d elements, Q5_K and Q6_K, exact)\n",
-           TRIALS, 256 * SUPERBLOCKS);
+           "(%d rows x %d elements, Q5_K and Q6_K, plus %d PQ2_0, exact)\n",
+           TRIALS, 256 * SUPERBLOCKS, 128 * SUPERBLOCKS);
     return 0;
 }
