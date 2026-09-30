@@ -180,6 +180,12 @@ void ds4_ple_row_ids(const ds4_ple_constants *c,
  * scale then 16 packed bytes; the low nibbles fill the first 16 values of the
  * block and the high nibbles the last 16. */
 void ds4_ple_dequant_iq4_nl(const void *blocks, size_t block_count, float *out);
+/* Dequantize `block_count` Q8_0 blocks into `block_count * 32` floats.
+ *
+ * ggml `block_q8_0` layout: one f16 scale then 32 int8 payloads; element j
+ * is d * qs[j].  Same call shape as ds4_ple_dequant_iq4_nl so the gather
+ * dispatches on the bound table type without knowing the byte layout. */
+void ds4_ple_dequant_q8_0(const void *blocks, size_t block_count, float *out);
 
 /* --------------------------------------------------------------- table */
 

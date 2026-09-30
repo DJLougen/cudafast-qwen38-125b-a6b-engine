@@ -2284,6 +2284,13 @@ static const gguf_type_info gguf_types[] = {
     [29] = {"iq1_m",  256,  56},
     [30] = {"bf16",     1,   2},
     [39] = {"mxfp4",   32,  17},
+    /* lowbitFlash PQ2_0 (ggml type 142): ternary {-1,0,+1} codes packed two
+     * bits each over a 128-element block, one fp16 group scale.  Verified
+     * against the byte contract in prism-llama.cpp's dequantize_row_pq2_0:
+     * block = 34 bytes = 2-byte fp16 scale + 32 packed code bytes.  Type 143
+     * (PTQ1_0) is deliberately absent: no shipped artifact carries it and a
+     * table row here is an admission ticket, not a description. */
+    [142] = {"pq2_0",   128, 34},
 };
 
 enum {
@@ -2303,6 +2310,9 @@ enum {
     DS4_TENSOR_I32      = 26,
     DS4_TENSOR_BF16     = 30,
     DS4_TENSOR_MXFP4    = 39,
+    /* ggml type 142, the same id the prism-llama.cpp loader and the
+     * lowbitFlash GGUF writer use; not sequential with the stock ids. */
+    DS4_TENSOR_PQ2_0    = 142,
 };
 
 typedef struct {

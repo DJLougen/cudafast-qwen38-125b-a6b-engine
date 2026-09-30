@@ -815,6 +815,37 @@ void ds4_ple_dequant_iq4_nl(const void *__restrict blocks, size_t block_count,
         p += DS4_PLE_IQ4_NL_BLOCK_BYTES;
     }
 }
+/* ggml `block_q8_0`: two-byte f16 scale then 32 int8 payloads, 34 bytes per
+ * block of 32 values; element j is d * qs[j].  Mirrors ggml's
+ * dequantize_row_q8_0 and the CUDA group's byte layout one-for-one, so a row
+ * dequantized here is the row the device path's Q8_0 weight accessor reads. */
+#define DS4_PLE_Q8_0_BLOCK_ELEMS 32
+#define DS4_PLE_Q8_0_BLOCK_BYTES 34
+
+void ds4_ple_dequant_q8_0(const void *__restrict blocks, size_t block_count,
+                          float *__restrict out) {
+    const uint8_t *__restrict p = (const uint8_t *)blocks;
+    if (!p || !out) return;
+
+    for (size_t b = 0; b < block_count; b++) {
+        if (b + 1u < block_count)
+            __builtin_prefetch(p + DS4_PLE_Q8_0_BLOCK_BYTES, 0, 1);
+        uint16_t half;
+        memcpy(&half, p, sizeof(half));
+        const float d = ple_fp16_to_fp32(half);
+        const int8_t *qs = (const int8_t *)(p + 2);
+        float *y = out + b * DS4_PLE_Q8_0_BLOCK_ELEMS;
+
+        if (b + 1u < block_count)
+            __builtin_prefetch(y + DS4_PLE_Q8_0_BLOCK_ELEMS, 1, 3);
+
+        for (int j = 0; j < DS4_PLE_Q8_0_BLOCK_ELEMS; j++) {
+            y[j] = d * (float)qs[j];
+        }
+        p += DS4_PLE_Q8_0_BLOCK_BYTES;
+    }
+}
+
 
 /* =========================================================================
  * Table.
