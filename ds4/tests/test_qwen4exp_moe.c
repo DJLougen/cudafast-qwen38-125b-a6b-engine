@@ -2168,6 +2168,8 @@ static void run_moe_input_reuse_case(
              * eight-warp prefill kernel the chain above used at rows >= 64
              * (the 64, 65 and 1024 widths here): the same chain, byte for
              * byte. */
+            fprintf(stderr, "DBG before narrow arm w=%u pat=%u\n", c.rows, pattern);
+            fflush(stderr);
             require_ok(setenv("DS4_QWEN4EXP_NO_QUANT_WIDE", "1", 1) == 0,
                        "one-warp quantiser select");
             moe_reuse_chain(&c, 1);
@@ -2178,6 +2180,8 @@ static void run_moe_input_reuse_case(
                 require_ok(memcmp(ref[j], got, sizes[j]) == 0,
                            "one-warp quantiser equals wide quantiser output");
             }
+            fprintf(stderr, "DBG narrow arm done w=%u pat=%u\n", c.rows, pattern);
+            fflush(stderr);
 #endif
 #if !defined(__APPLE__) && !defined(__HIP_PLATFORM_AMD__)
             if (capture) {
