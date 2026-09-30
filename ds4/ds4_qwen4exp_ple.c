@@ -58,8 +58,9 @@ enum {
     PLE_GGUF_FLOAT64 = 12,
 };
 
-/* GGUF tensor type of IQ4_NL. */
+/* GGUF tensor types the table can carry. */
 #define PLE_GGUF_TYPE_IQ4_NL 20
+#define PLE_GGUF_TYPE_Q8_0    8
 
 #define PLE_TABLE_TENSOR "per_layer_token_embd.weight"
 
@@ -488,7 +489,8 @@ static bool ple_finish_constants(const ple_scan *s, ds4_ple_constants *out,
     }
     if (s->row_dim == 0 || s->row_dim % DS4_PLE_IQ4_NL_BLOCK_ELEMS != 0) {
         ple_err(err, err_size,
-                "ds4_ple: row width %u is not a multiple of the IQ4_NL block of %d",
+                "ds4_ple: row width %u is not a multiple of the %d-element "
+                "quant block",
                 s->row_dim, DS4_PLE_IQ4_NL_BLOCK_ELEMS);
         return false;
     }
@@ -857,6 +859,7 @@ struct ds4_ple_table {
     uint64_t          tensor_offset;
     size_t            quant_row_bytes;
     size_t            row_floats;
+    uint32_t          tensor_type;   /* GGUF type id: IQ4_NL or Q8_0 */
 
     /* Hot set: a fixed arena of dequantized rows in least-recently-used
      * order.  Sized once from the ceiling, so there is no growth path and no
@@ -975,7 +978,15 @@ static void ple_chain_insert(ds4_ple_table *t, int32_t slot) {
 /* Dequantize one row of the mapping into `dst`. */
 static void ple_read_row(const ds4_ple_table *t, uint64_t row, float *dst) {
     const uint8_t *src = t->mapping.map + t->tensor_offset + row * t->quant_row_bytes;
-    ds4_ple_dequant_iq4_nl(src, t->constants.row_dim / DS4_PLE_IQ4_NL_BLOCK_ELEMS, dst);
+    if (t->tensor_type == PLE_GGUF_TYPE_Q8_0) {
+        ds4_ple_dequant_q8_0(src,
+                             t->constants.row_dim / DS4_PLE_Q8_0_BLOCK_ELEMS,
+                             dst);
+    } else {
+        ds4_ple_dequant_iq4_nl(src,
+                               t->constants.row_dim / DS4_PLE_IQ4_NL_BLOCK_ELEMS,
+                               dst);
+    }
 }
 
 static void ple_size_hot_set(ds4_ple_table *t, uint64_t ceiling) {
@@ -1038,9 +1049,12 @@ bool ds4_ple_table_open(const char *const *gguf_paths, size_t path_count,
         return false;
     }
 
-    if (scan.tensor_type != PLE_GGUF_TYPE_IQ4_NL) {
-        ple_err(err, err_size, "ds4_ple: %s is GGUF type %u; IQ4_NL (%d) expected",
-                PLE_TABLE_TENSOR, scan.tensor_type, PLE_GGUF_TYPE_IQ4_NL);
+    if (scan.tensor_type != PLE_GGUF_TYPE_IQ4_NL &&
+        scan.tensor_type != PLE_GGUF_TYPE_Q8_0) {
+        ple_err(err, err_size,
+                "ds4_ple: %s is GGUF type %u; IQ4_NL (%d) or Q8_0 (%d) expected",
+                PLE_TABLE_TENSOR, scan.tensor_type, PLE_GGUF_TYPE_IQ4_NL,
+                PLE_GGUF_TYPE_Q8_0);
         ds4_ple_table_close(t);
         return false;
     }
@@ -1059,9 +1073,17 @@ bool ds4_ple_table_open(const char *const *gguf_paths, size_t path_count,
         return false;
     }
     t->constants.table_rows = scan.tensor_dim1;
+    t->tensor_type          = scan.tensor_type;
 
-    t->quant_row_bytes = (size_t)(t->constants.row_dim / DS4_PLE_IQ4_NL_BLOCK_ELEMS) *
-                         DS4_PLE_IQ4_NL_BLOCK_BYTES;
+    if (scan.tensor_type == PLE_GGUF_TYPE_Q8_0) {
+        t->quant_row_bytes =
+            (size_t)(t->constants.row_dim / DS4_PLE_Q8_0_BLOCK_ELEMS) *
+            DS4_PLE_Q8_0_BLOCK_BYTES;
+    } else {
+        t->quant_row_bytes =
+            (size_t)(t->constants.row_dim / DS4_PLE_IQ4_NL_BLOCK_ELEMS) *
+            DS4_PLE_IQ4_NL_BLOCK_BYTES;
+    }
     t->row_floats      = t->constants.row_dim;
     t->tensor_offset   = scan.tensor_offset;
 

@@ -208,7 +208,8 @@ void ds4_ple_table_close(ds4_ple_table *t);
 
 const ds4_ple_constants *ds4_ple_table_constants(const ds4_ple_table *t);
 
-/* Bytes one quantized row occupies in the file: row_dim / 32 * 18. */
+/* Bytes one quantized row occupies in the file: row_dim / 32 * 18 for an
+ * IQ4_NL table, row_dim / 32 * 34 for a Q8_0 one. */
 size_t ds4_ple_table_quant_row_bytes(const ds4_ple_table *t);
 
 /* Dequantized rows for `count` row ids, row-major [count][row_dim].
