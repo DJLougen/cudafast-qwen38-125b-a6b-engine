@@ -26,6 +26,9 @@
  *   q4_K  routed gate/up on most blocks of UD-Q4_K_XL
  *   q5_K  routed gate/up on block 2 of UD-Q4_K_XL, and on 44 blocks of MQ-Q6
  *   q6_K  routed gate/up on four blocks of MQ-Q6
+ *   pq2_0 lowbitFlash ternary experts (ggml type 142): the routed expert
+ *         tensors of the rotated-basis lowbitflash artifacts; see
+ *         dev_qwen4exp_pq2_0_value in ds4_cuda_qwen4exp.cu
  *
  * tests/test_qwen4exp_moe.c carries the measured per-block table.
  *
@@ -38,6 +41,7 @@
     X(q8_0,  8) \
     X(q4_K, 12) \
     X(q5_K, 13) \
-    X(q6_K, 14)
+    X(q6_K, 14) \
+    X(pq2_0, 142)
 
 #endif /* DS4_QWEN4EXP_MOE_TYPES_H */

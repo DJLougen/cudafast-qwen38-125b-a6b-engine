@@ -350,6 +350,14 @@ struct ds4_qwen4exp_session {
     ds4_gpu_tensor   *ple_aux;        /* query, then the convolution input */
     ds4_gpu_tensor   *ple_value;      /* value projection, [n_batch][embd] */
 
+    /* lowbitflash.rot.* sign diagonals, device-resident.  The weights keep
+     * the i32 table inside the GGUF mapping; the fused rotation kernel takes
+     * fp32 signs, so each rotated layer uploads two tables once at session
+     * open and lbf_rot_args points at them.  NULL on unrotated layers. */
+    ds4_gpu_tensor   *lbf_signs_in[DS4_MAX_LAYER];   /* gate/up input  */
+    ds4_gpu_tensor   *lbf_signs_mid[DS4_MAX_LAYER];  /* down-proj mid  */
+    ds4_gpu_qwen4exp_rot lbf_rot_args[DS4_MAX_LAYER];
+
     /* Rollback bookkeeping.  A rejecting round has written state for a token
      * that is not committed; these are the snapshots and cursors that undo it.
      * The GDN state and the PLE conv state are SNAPSHOT class -- overwritten in
@@ -777,6 +785,41 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
         }
     }
 
+    /* lowbitflash.rot sign uploads.  Per layer with a live spec: the two
+     * tables are converted i32 -> f32 once and copied to session-owned
+     * device buffers; the fp32 / i32 distinction is the whole reason this
+     * copy exists -- the GGUF stores the contract's integer signs and the
+     * kernel multiplies floats. */
+    for (uint32_t il = 0; il < cfg->n_layer && ok; il++) {
+        const ds4_qwen4exp_layer_weights *lw = &w->layer[il];
+        ds4_gpu_qwen4exp_rot *rot = &s->lbf_rot_args[il];
+        memset(rot, 0, sizeof(*rot));
+        const ds4_qwen4exp_rot_spec *specs[2] =
+            { &lw->rot_gate_up, &lw->rot_down };
+        ds4_gpu_tensor **dst[2] =
+            { &s->lbf_signs_in[il], &s->lbf_signs_mid[il] };
+        ds4_gpu_qwen4exp_rot_in *side[2] = { &rot->in, &rot->mid };
+        for (int k = 0; k < 2 && ok; k++) {
+            if (!specs[k]->present) continue;
+            const uint32_t nw = specs[k]->width;
+            *dst[k] = qwen4exp_alloc_zeroed((uint64_t)nw * f, &ok);
+            if (!ok) break;
+            float *host = malloc((size_t)nw * sizeof(float));
+            if (!host) { ok = false; break; }
+            for (uint32_t j = 0; j < nw; j++)
+                host[j] = (float)specs[k]->signs[j];
+            ok = ds4_gpu_tensor_write(*dst[k], 0, host,
+                                      (uint64_t)nw * sizeof(float));
+            free(host);
+            if (!ok) break;
+            side[k]->signs  = (const float *)ds4_gpu_tensor_contents(*dst[k]);
+            side[k]->width  = nw;
+            side[k]->n_seg  = specs[k]->n_seg;
+            memcpy(side[k]->seg_size, specs[k]->seg_size,
+                   sizeof(side[k]->seg_size));
+        }
+    }
+
     /* The PLE block.  Every artifact this build accepts names exactly one PLE
      * block, so the buffers are unconditional and the memory plan charges for
      * them; only the gathered rows, the block scratch and the rolling window
@@ -929,6 +972,8 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
         ds4_gpu_tensor_free(s->idx_k_norm[il]);
         ds4_gpu_tensor_free(s->attn_q_norm[il]);
         ds4_gpu_tensor_free(s->attn_k_norm[il]);
+        ds4_gpu_tensor_free(s->lbf_signs_in[il]);
+        ds4_gpu_tensor_free(s->lbf_signs_mid[il]);
     }
     ds4_gpu_tensor_free(s->ple_conv_state);
     ds4_gpu_tensor_free(s->ple_conv_snapshot);
@@ -1147,6 +1192,26 @@ void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
  * knob); a positive value pins the thread count.  Unset, the gather takes
  * the online CPUs capped at 16 -- enough to keep the SSD queue deep without
  * starving the decode path's own helpers. */
+/* The PLE row dequant dispatches on the bound table's GGUF type.  IQ4_NL and
+ * Q8_0 both pack 32 values per block, so `blocks_per_row` is the row's block
+ * count for either; the row's byte stride stays w->ple.row_bytes either way.
+ * Any other bound type is refused by name at the gather's gate, so a table
+ * that slipped the bind-time type list cannot produce silently wrong rows. */
+static int qw_ple_dequant_row(const ds4_qwen4exp_ple_table *ple,
+                              const uint8_t *quant,
+                              uint32_t blocks_per_row, float *dst) {
+    switch (ple->type) {
+    case DS4_TENSOR_IQ4_NL:
+        ds4_ple_dequant_iq4_nl(quant, blocks_per_row, dst);
+        return 1;
+    case DS4_TENSOR_Q8_0:
+        ds4_ple_dequant_q8_0(quant, blocks_per_row, dst);
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 typedef struct {
     const ds4_qwen4exp_ple_table *ple;
     const ds4_qwen4exp_session   *s;
@@ -1192,10 +1257,12 @@ static void *qw_ple_gather_worker(void *arg) {
                 seg->s->ple_ids[(uint64_t)t * DS4_N_PLE_HEAD + h];
             const uint8_t *quant = ds4_qwen4exp_ple_row(seg->ple, row);
             if (!quant) { seg->ok = 0; return NULL; }
-            ds4_ple_dequant_iq4_nl(
-                quant, seg->blocks_per_row,
+            if (!qw_ple_dequant_row(seg->ple, quant, seg->blocks_per_row,
                 seg->s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD +
-                    (uint64_t)h * DS4_N_PLE_ROW_DIM);
+                    (uint64_t)h * DS4_N_PLE_ROW_DIM)) {
+                seg->ok = 0;
+                return NULL;
+            }
         }
     }
     return NULL;
@@ -1303,11 +1370,12 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                 "but the artifact's hash constants could not be read\n", il);
         return false;
     }
-    if (w->ple.type != DS4_TENSOR_IQ4_NL) {
+    if (w->ple.type != DS4_TENSOR_IQ4_NL &&
+        w->ple.type != DS4_TENSOR_Q8_0) {
         fprintf(stderr,
-                "ds4: qwen4exp block %u needs the n-gram table as IQ4_NL; this "
-                "artifact stores it as type %u, which no gather covers\n",
-                il, w->ple.type);
+                "ds4: qwen4exp block %u needs the n-gram table as IQ4_NL or "
+                "Q8_0; this artifact stores it as type %u, which no gather "
+                "covers\n", il, w->ple.type);
         return false;
     }
     if (w->ple.row_dim != DS4_N_PLE_ROW_DIM ||
@@ -1374,7 +1442,12 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                             il, t, h, row, w->ple.rows);
                     return false;
                 }
-                ds4_ple_dequant_iq4_nl(quant, blocks_per_row, dst);
+                if (!qw_ple_dequant_row(&w->ple, quant, blocks_per_row, dst)) {
+                    fprintf(stderr,
+                            "ds4: qwen4exp block %u PLE table type %u has no "
+                            "row dequant\n", il, w->ple.type);
+                    return false;
+                }
                 dst += DS4_N_PLE_ROW_DIM;
             }
         }
@@ -1427,10 +1500,14 @@ static bool qwen4exp_graph_ple_gather(ds4_qwen4exp_session *s,
                                 il, t, h, row, w->ple.rows);
                         return false;
                     }
-                    ds4_ple_dequant_iq4_nl(
-                        quant, blocks_per_row,
+                    if (!qw_ple_dequant_row(&w->ple, quant, blocks_per_row,
                         s->ple_rows_host + (uint64_t)t * DS4_N_PLE_EMBD +
-                            (uint64_t)h * DS4_N_PLE_ROW_DIM);
+                            (uint64_t)h * DS4_N_PLE_ROW_DIM)) {
+                        fprintf(stderr,
+                                "ds4: qwen4exp block %u PLE table type %u has "
+                                "no row dequant\n", il, w->ple.type);
+                        return false;
+                    }
                 }
             }
         } else {
@@ -2187,14 +2264,22 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
     const ds4_gpu_qwen4exp_slab gate_slab = QW_SLAB(m, l->ffn_gate_exps);
     const ds4_gpu_qwen4exp_slab up_slab = QW_SLAB(m, l->ffn_up_exps);
     const ds4_gpu_qwen4exp_slab down_slab = QW_SLAB(m, l->ffn_down_exps);
-    if (!ds4_gpu_qwen4exp_routed_moe_router_tensor(
+    /* The layer's lowbitflash rotations, or all-NULL when the artifact
+     * carries none -- the entry is the same call either way.  The head
+     * block's index is legal: lbf_rot_args is sized DS4_MAX_LAYER and every
+     * entry the open loop skipped stays zeroed, which is "no rotation". */
+    const ds4_gpu_qwen4exp_rot *rot =
+        (l->rot_gate_up.present || l->rot_down.present)
+            ? &s->lbf_rot_args[il] : NULL;
+    if (!ds4_gpu_qwen4exp_routed_moe_router_rot_tensor(
             s->block_out, s->moe_mid, s->moe_down_partial,
             &gate_slab, &up_slab, &down_slab,
             DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD,
             s->moe_selected, s->moe_weights, DS4_N_EXPERT, DS4_N_EXPERT_USED,
             s->mixed, n_tokens, DS4_N_EXPERT_USED * DS4_N_FF_EXP,
             moe_fuse_router ? s->moe_logits : NULL,
-            moe_fuse_router ? s->moe_weights : NULL)) {
+            moe_fuse_router ? s->moe_weights : NULL,
+            rot)) {
         fprintf(stderr, "ds4: qwen4exp routed experts failed at block %u\n", il);
         return false;
     }
@@ -2208,7 +2293,8 @@ static bool qwen4exp_graph_moe_block(ds4_qwen4exp_session *s,
     /* Routed and shared experts read the same mixed activation in this
      * stream. Routed scratch retains its quantization through this call;
      * Metal's prequantized entry point keeps its ordinary implementation. */
-    const int reuse_quant = getenv("DS4_QWEN4EXP_NO_MOE_QUANT_REUSE") == NULL;
+    const int reuse_quant = !l->rot_gate_up.present &&
+        getenv("DS4_QWEN4EXP_NO_MOE_QUANT_REUSE") == NULL;
     if (!ds4_gpu_qwen4exp_shared_expert_preq_tensor(
             s->block_out, s->shexp_mid, s->shexp_gate,
             &sh_router_slab, &sh_gate_slab, &sh_up_slab, &sh_down_slab,

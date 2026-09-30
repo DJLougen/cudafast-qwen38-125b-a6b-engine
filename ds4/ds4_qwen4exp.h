@@ -112,6 +112,26 @@ typedef struct {
     uint64_t multipliers[DS4_QWEN4EXP_MAX_NGRAM];
 } ds4_qwen4exp_ple_table;
 
+/* One fused lowbitflash segmented rotation (GGUF keys lowbitflash.rot.*,
+ * contract version 1).  A rotated weight W_r is deployed where
+ * y = W x == W_r (R x) with R = block-diag(H_b D_b): the runtime applies the
+ * rotation to the activation, per input-dim segment, before the quantized
+ * matmul.  `signs` points into the shard 0 mapping's i32 KV array (entries
+ * are exactly +/-1, validated at bind); `seg_size` partitions the input dim
+ * into power-of-two blocks, each a multiple of 128; `width` is their sum.
+ * `present` false means no rotation -- weight stored in the primal basis.
+ * An artifact that lists the tensor in lowbitflash.rot.weight_names but has
+ * no usable spec never reaches a kernel: the binder refuses it by name. */
+#define DS4_QWEN4EXP_ROT_MAX_SEG 8
+
+typedef struct {
+    bool            present;
+    uint32_t        width;                  /* input dim, sum of seg_size */
+    uint32_t        n_seg;                  /* 1..DS4_QWEN4EXP_ROT_MAX_SEG  */
+    uint32_t        seg_size[DS4_QWEN4EXP_ROT_MAX_SEG];
+    const int32_t  *signs;                  /* [width] +/-1, mmap-resident  */
+} ds4_qwen4exp_rot_spec;
+
 /*
  * One block.  Slots that do not apply to the block type stay NULL:
  * GDN blocks have attn_qkv/attn_gate/ssm_*, QSA blocks have attn_q/k/v/output
@@ -156,6 +176,14 @@ typedef struct {
     ds4_tensor *ffn_gate_shexp;     /* Q8_0 [n_embd, n_ff_shexp]      */
     ds4_tensor *ffn_up_shexp;       /* Q8_0 [n_embd, n_ff_shexp]      */
     ds4_tensor *ffn_down_shexp;     /* Q8_0 [n_ff_shexp, n_embd]      */
+
+    /* lowbitflash.rot.* activation rotations for this block's routed experts.
+     * gate_exps and up_exps are one fused rotation: their weight_names
+     * entries carry the same signs (derived from the shared HF gate_up name),
+     * checked byte-equal at bind.  rot_down is ffn_down_exps' own spec.  An
+     * empty spec means the tensors decode to the primal basis, no rotation. */
+    ds4_qwen4exp_rot_spec rot_gate_up;
+    ds4_qwen4exp_rot_spec rot_down;
 
     /* Hyper connections, every block.  hc_dim = n_hc * n_embd. */
     ds4_tensor *hc_attn_down;   /* Q8_0 [hc_dim, hc_lowrank] */
@@ -228,6 +256,7 @@ typedef struct {
 
     uint32_t n_layer;
     ds4_qwen4exp_layer_weights layer[DS4_MAX_LAYER];
+    bool     has_lbf_rot;    /* any layer carries a rotation spec          */
 } ds4_qwen4exp_weights;
 
 /* Runtime geometry read out of the GGUF.  The fixed geometry lives in

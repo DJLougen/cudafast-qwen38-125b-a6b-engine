@@ -2980,6 +2980,60 @@ typedef struct {
     uint64_t    row_bytes;
     uint32_t    type;
 } ds4_gpu_qwen4exp_slab;
+
+/* ------------------------------------------------------------------------
+ * lowbitFlash rotated-basis experts (lowbitflash.rot.*, contract version 1).
+ *
+ * A rotated weight W_r = W * Rbar is deployed where Rbar = block-diag(D_b H_b)
+ * and y = W x is computed as W_r (R x), R = block-diag(H_b D_b).  The runtime
+ * applies R to the activation row inside the activation quantiser: per input
+ * segment, multiply by the fp32 sign diagonal D_b, run the normalised
+ * Sylvester Walsh-Hadamard transform H_b, then Q8_0-quantise the rotated
+ * floats exactly as dev_qwen4exp_quantize_group does for an unrotated row.
+ *
+ * `signs` is a DEVICE pointer to `width` fp32 +/-1 entries (the GGUF stores
+ * i32; the session converts at upload).  seg_size[] partitions the row into
+ * power-of-two segments, each a multiple of 128, summing to the row width.
+ * A spec with n_seg == 0 means no rotation: the fused kernel degenerates to
+ * the plain quantiser's math only in the sense that the caller should not
+ * take this path at all then -- callers pass NULL instead.
+ */
+#define DS4_GPU_QWEN4EXP_ROT_MAX_SEG 8
+
+typedef struct {
+    const float *signs;     /* device, [width] +/-1 */
+    uint32_t     width;     /* input dim the rotation covers */
+    uint32_t     n_seg;     /* 1..DS4_GPU_QWEN4EXP_ROT_MAX_SEG */
+    uint32_t     seg_size[DS4_GPU_QWEN4EXP_ROT_MAX_SEG];
+} ds4_gpu_qwen4exp_rot_in;
+
+typedef struct {
+    /* x_in is the shared expert input; ffn_gate_exps and ffn_up_exps share
+     * one rotation (same fused sign set, checked identical at bind), so a
+     * single rotated quantisation serves both projections.  mid is the
+     * per-(token, expert-slot) gate/up intermediate that feeds
+     * ffn_down_exps.  n_seg == 0 on either side disables that side. */
+    ds4_gpu_qwen4exp_rot_in in;
+    ds4_gpu_qwen4exp_rot_in mid;
+} ds4_gpu_qwen4exp_rot;
+
+/* The rotation + Q8_0 quantiser, exposed for its kernel-level test.
+ * Quantises `rows` rows of `width` floats into the same xq/xs/xsum layout
+ * the MoE scratch uses; `rot` applies the segmented sign+FWHT to each row
+ * first.  Row addressing follows qwen4exp_quantize_rows: row r starts at
+ * outer_stride * (r / inner_count) + inner_stride * (r % inner_count).
+ * Returns nonzero on launch success. */
+int ds4_gpu_qwen4exp_lbf_rot_quantize(
+        int8_t                         *xq,
+        float                          *xs,
+        int32_t                        *xsum,
+        const float                    *src,
+        const ds4_gpu_qwen4exp_rot_in  *rot,
+        uint32_t                        rows,
+        uint32_t                        width,
+        uint64_t                        outer_stride,
+        uint64_t                        inner_stride,
+        uint32_t                        inner_count);
 /* Four GDN projections in QKV, gate, alpha, beta order; independent mappings. */
 int ds4_gpu_qwen4exp_gdn_projections_exact_tensor(
         ds4_gpu_tensor *const outs[4], const void *const maps[4],
@@ -3051,6 +3105,40 @@ int ds4_gpu_qwen4exp_routed_moe_router_tensor(
         uint32_t                     mid_token_stride,
         const ds4_gpu_tensor        *logits,
         ds4_gpu_tensor              *weights_rw);
+
+/* ds4_gpu_qwen4exp_routed_moe_router_tensor with the lowbitFlash segmented
+ * activation rotations applied inside the quantisers: `rot->in` rotates and
+ * quantises the shared routed input `x` before the gate/up projections read
+ * it, `rot->mid` rotates the gate/up intermediate before the down projection
+ * reads it.  Pass NULL for an unrotated artifact -- identical launches, byte
+ * for byte.  A NULL input on one side with a live one on the other is legal.
+ *
+ * When rot is non-NULL the call cannot reuse the mixer-folded xq (that fold
+ * writes the UNROTATED quantisation), so the folded-publish handshake is
+ * skipped for the layer; the next layer's mixer sees no arm and does not
+ * fold either, keeping the rotated path live every layer.  The gate/up
+ * epilogue that quantises mid directly into the down scratch is likewise
+ * disabled, since its consumer is the rotated mid, not the raw one. */
+int ds4_gpu_qwen4exp_routed_moe_router_rot_tensor(
+        ds4_gpu_tensor              *out,
+        ds4_gpu_tensor              *mid,
+        ds4_gpu_tensor              *down_partial,
+        const ds4_gpu_qwen4exp_slab *gate,
+        const ds4_gpu_qwen4exp_slab *up,
+        const ds4_gpu_qwen4exp_slab *down,
+        uint32_t                     in_dim,
+        uint32_t                     mid_dim,
+        uint32_t                     out_dim,
+        const ds4_gpu_tensor        *selected,
+        const ds4_gpu_tensor        *weights,
+        uint32_t                     n_total_expert,
+        uint32_t                     n_expert_used,
+        const ds4_gpu_tensor        *x,
+        uint32_t                     n_tokens,
+        uint32_t                     mid_token_stride,
+        const ds4_gpu_tensor        *logits,
+        ds4_gpu_tensor              *weights_rw,
+        const ds4_gpu_qwen4exp_rot  *rot);
 
 int ds4_gpu_qwen4exp_shared_expert_tensor(
         ds4_gpu_tensor              *out,

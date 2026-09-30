@@ -716,7 +716,7 @@ static DS4_MAYBE_UNUSED void config_validate_qwen4exp_mtp_model(const ds4_model 
  * Tensor binding
  * ------------------------------------------------------------------------ */
 
-#define DS4_QWEN4EXP_MAX_TYPES 6
+#define DS4_QWEN4EXP_MAX_TYPES 8
 
 typedef struct {
     const char *name;
@@ -1240,6 +1240,280 @@ static void qwen4exp_memory_guard(const ds4_qwen4exp_mem_plan *plan) {
  * memory guard.  Refuses by name on the first tensor that is missing, has the
  * wrong quantization, or has the wrong shape.
  */
+/* ------------------------------------------------------------------------
+ * lowbitflash.rot.* -- segmented activation rotation metadata
+ *
+ * Contract version 1 (shared with prism-llama.cpp's lbf path and the GGUF
+ * converter): a rotated weight W_r stores rows pre-multiplied by
+ * Rbar = block-diag(D_b H_b), so the runtime applies R = block-diag(H_b D_b)
+ * to the activation before each rotated matmul.  The metadata is key-values,
+ * not tensors:
+ *
+ *   lowbitflash.rot.version        u32  = 1
+ *   lowbitflash.rot.weight_names   str[] rotated weight tensor names
+ *   lowbitflash.rot.blocks.<name>  i32[] pow2 block sizes, sum = input dim
+ *   lowbitflash.rot.signs.<name>   i32[] +/-1 per input-dim element
+ *
+ * This build binds a spec only for the fused expert tensors,
+ * blk.N.ffn_{gate,up,down}_exps.weight.  Gate and up carry TWO names over
+ * the same sign bytes (they descend from one fused HF tensor), so the two
+ * specs must be byte-identical; the shared MoE input is rotated once.
+ *
+ * Fail-closed everywhere: an unknown version, a weight name outside the
+ * expert set, an inverse_names table (no embed-side inverse path exists
+ * here), a malformed segment list or a sign that is not +/-1 are all fatal
+ * at bind rather than a silent no-rotation.  The converse is checked too:
+ * a PQ2_0 expert tensor carries weights in the rotated basis by contract,
+ * so a PQ2_0 tensor whose layer has no matching spec is refused. */
+
+#define QW_ROT_VERSION 1u
+
+typedef struct {
+    bool seen, attached;
+    ds4_qwen4exp_rot_spec spec;
+} qw_rot_slot;
+
+/* Parse "blk.<il>.<suffix>" where suffix is one of the three fused expert
+ * names; role 0 = gate/up (input rotation), 1 = down (mid rotation). */
+static int qwen4exp_rot_name_role(const char *name, uint32_t *il_out) {
+    if (strncmp(name, "blk.", 4) != 0) return -1;
+    const char *p = name + 4;
+    if (!(*p >= '0' && *p <= '9')) return -1;
+    uint32_t il = 0;
+    while (*p >= '0' && *p <= '9') {
+        il = il * 10u + (uint32_t)(*p - '0');
+        p++;
+    }
+    if (*p != '.') return -1;
+    p++;
+    if (strcmp(p, "ffn_gate_exps.weight") == 0 ||
+        strcmp(p, "ffn_up_exps.weight") == 0) {
+        *il_out = il;
+        return 0;
+    }
+    if (strcmp(p, "ffn_down_exps.weight") == 0) {
+        *il_out = il;
+        return 1;
+    }
+    return -1;
+}
+
+/* Parse one weight's spec: block sizes then the sign array.  The sign
+ * pointer stays into the shard-0 mapping; the tensor is never copied. */
+static void qwen4exp_rot_parse_spec(const ds4_model *m, const char *name,
+                                    ds4_qwen4exp_rot_spec *spec) {
+    memset(spec, 0, sizeof(*spec));
+
+    char key[192];
+    int kn = snprintf(key, sizeof(key), "lowbitflash.rot.blocks.%s", name);
+    if (kn < 0 || (size_t)kn >= sizeof(key)) {
+        qwen4exp_die("lowbitflash.rot key too long for %s", name);
+    }
+    ds4_array_ref barr = {0};
+    if (!model_get_array(m, key, &barr)) {
+        qwen4exp_die("lowbitflash.rot: %s is listed in weight_names but "
+                     "%s is missing", name, key);
+    }
+    if (barr.type != GGUF_VALUE_INT32 || barr.len == 0 ||
+        barr.len > DS4_QWEN4EXP_ROT_MAX_SEG) {
+        qwen4exp_die("lowbitflash.rot: %s must be an i32 array of 1..%u "
+                     "block sizes, found type %u len %" PRIu64,
+                     key, (uint32_t)DS4_QWEN4EXP_ROT_MAX_SEG,
+                     barr.type, barr.len);
+    }
+    if (barr.data_pos > m->size ||
+        barr.len > (m->size - barr.data_pos) / sizeof(int32_t)) {
+        qwen4exp_die("lowbitflash.rot: %s data overruns the metadata", key);
+    }
+    const int32_t *blocks = (const int32_t *)(const void *)(m->map + barr.data_pos);
+
+    uint64_t sum = 0;
+    for (uint64_t i = 0; i < barr.len; i++) {
+        const int32_t b = blocks[i];
+        if (b < 128 || (b & (b - 1)) != 0) {
+            qwen4exp_die("lowbitflash.rot: %s entry %d is not a power-of-two "
+                         "multiple of 128", key, b);
+        }
+        sum += (uint64_t)b;
+        spec->seg_size[i] = (uint32_t)b;
+    }
+    if (sum > UINT32_MAX) {
+        qwen4exp_die("lowbitflash.rot: %s block sizes overflow", key);
+    }
+    spec->n_seg = (uint32_t)barr.len;
+    spec->width = (uint32_t)sum;
+
+    kn = snprintf(key, sizeof(key), "lowbitflash.rot.signs.%s", name);
+    if (kn < 0 || (size_t)kn >= sizeof(key)) {
+        qwen4exp_die("lowbitflash.rot key too long for %s", name);
+    }
+    ds4_array_ref sarr = {0};
+    if (!model_get_array(m, key, &sarr)) {
+        qwen4exp_die("lowbitflash.rot: %s is listed in weight_names but "
+                     "%s is missing", name, key);
+    }
+    if (sarr.type != GGUF_VALUE_INT32 || sarr.len != sum) {
+        qwen4exp_die("lowbitflash.rot: %s must be an i32 array of %" PRIu64
+                     " signs, found type %u len %" PRIu64,
+                     key, sum, sarr.type, sarr.len);
+    }
+    if (sarr.data_pos > m->size ||
+        sarr.len > (m->size - sarr.data_pos) / sizeof(int32_t)) {
+        qwen4exp_die("lowbitflash.rot: %s data overruns the metadata", key);
+    }
+    const int32_t *signs =
+        (const int32_t *)(const void *)(m->map + sarr.data_pos);
+    for (uint64_t i = 0; i < sarr.len; i++) {
+        if (signs[i] != 1 && signs[i] != -1) {
+            qwen4exp_die("lowbitflash.rot: %s[%u] is %d, not +/-1",
+                         key, (uint32_t)i, signs[i]);
+        }
+    }
+    spec->signs = signs;
+    spec->present = true;
+}
+
+static int qwen4exp_rot_specs_equal(const ds4_qwen4exp_rot_spec *a,
+                                    const ds4_qwen4exp_rot_spec *b) {
+    if (a->present != b->present || a->width != b->width ||
+        a->n_seg != b->n_seg) {
+        return 0;
+    }
+    if (!a->present) return 1;
+    if (memcmp(a->seg_size, b->seg_size,
+               a->n_seg * sizeof(a->seg_size[0])) != 0) return 0;
+    if (memcmp(a->signs, b->signs, a->width * sizeof(int32_t)) != 0) return 0;
+    return 1;
+}
+
+/* Read the rotation table and attach specs to the already-bound layers.
+ * Runs inside weights_bind_qwen4exp after the tensor loop so every listed
+ * weight's dim[0] can be checked against the bound tensor it claims to
+ * rotate. */
+static void qwen4exp_bind_lbf_rotations(ds4_qwen4exp_weights *w,
+                                        const ds4_model *m) {
+    uint32_t version = 0;
+    const bool has_version =
+        model_get_u32(m, "lowbitflash.rot.version", &version);
+
+    /* Any lowbitflash.rot.* key without a version is a malformed artifact:
+     * scan the whole table so a stray key cannot slip the check. */
+    for (uint64_t i = 0; i < m->n_kv; i++) {
+        if (ds4_str_starts_with(m->kv[i].key, "lowbitflash.rot.") &&
+            !has_version) {
+            qwen4exp_die("lowbitflash.rot keys present but "
+                         "lowbitflash.rot.version is missing");
+        }
+    }
+    if (!has_version) return;
+    if (version != QW_ROT_VERSION) {
+        qwen4exp_die("unsupported lowbitflash.rot.version: %u (this build "
+                     "implements %u)", version, QW_ROT_VERSION);
+    }
+    if (model_find_kv(m, "lowbitflash.rot.inverse_names")) {
+        qwen4exp_die("lowbitflash.rot.inverse_names is present but this "
+                     "build has no embed-side inverse rotation path");
+    }
+
+    ds4_array_ref names = {0};
+    if (!model_get_array(m, "lowbitflash.rot.weight_names", &names) ||
+        names.type != GGUF_VALUE_STRING) {
+        qwen4exp_die("lowbitflash.rot.version is set but "
+                     "lowbitflash.rot.weight_names is missing or not a "
+                     "string array");
+    }
+    if (names.len > (uint64_t)w->n_layer * 3u) {
+        qwen4exp_die("lowbitflash.rot.weight_names holds %" PRIu64
+                     " entries, more than the %u fused expert tensors this "
+                     "shape can name", names.len, w->n_layer * 3u);
+    }
+
+    qw_rot_slot *gu = calloc(w->n_layer, sizeof(*gu));
+    qw_rot_slot *dn = calloc(w->n_layer, sizeof(*dn));
+    if (!gu || !dn) {
+        qwen4exp_die("out of memory parsing lowbitflash.rot");
+    }
+
+    ds4_cursor c = cursor_at(m, names.data_pos);
+    for (uint64_t i = 0; i < names.len; i++) {
+        ds4_str nm = {0};
+        if (!cursor_string(&c, &nm)) ds4_die(c.error);
+        char z[160];
+        if (nm.len == 0 || nm.len >= sizeof(z)) {
+            qwen4exp_die("lowbitflash.rot.weight_names entry %" PRIu64
+                         " has a bad length %" PRIu64, i, nm.len);
+        }
+        memcpy(z, nm.ptr, nm.len);
+        z[nm.len] = '\0';
+
+        uint32_t il = 0;
+        const int role = qwen4exp_rot_name_role(z, &il);
+        if (role < 0 || il >= w->n_layer) {
+            qwen4exp_die("lowbitflash.rot: weight '%s' is not a routed "
+                         "expert tensor of this model", z);
+        }
+        qw_rot_slot *slot = role == 0 ? &gu[il] : &dn[il];
+        if (!slot->seen) {
+            qwen4exp_rot_parse_spec(m, z, &slot->spec);
+            slot->seen = true;
+        } else {
+            /* Gate and up name the same rotation; parse the second and
+             * require it byte-identical to the first. */
+            ds4_qwen4exp_rot_spec other;
+            qwen4exp_rot_parse_spec(m, z, &other);
+            if (!qwen4exp_rot_specs_equal(&slot->spec, &other)) {
+                qwen4exp_die("lowbitflash.rot: %s disagrees with its layer's "
+                             "other gate/up spec; the fused input rotation "
+                             "cannot serve both", z);
+            }
+        }
+    }
+
+    /* Attach, then the closed-world check: every bound expert tensor that
+     * is PQ2_0 must be covered by the spec it claims. */
+    for (uint32_t il = 0; il < w->n_layer; il++) {
+        ds4_qwen4exp_layer_weights *l = &w->layer[il];
+        if (gu[il].seen) {
+            l->rot_gate_up = gu[il].spec;
+            gu[il].attached = true;
+            if (l->rot_gate_up.width != (uint32_t)l->ffn_gate_exps->dim[0]) {
+                qwen4exp_die("lowbitflash.rot: blk.%u gate/up rotation covers "
+                             "%u inputs but ffn_gate_exps has %" PRIu64,
+                             il, l->rot_gate_up.width,
+                             l->ffn_gate_exps->dim[0]);
+            }
+        }
+        if (dn[il].seen) {
+            l->rot_down = dn[il].spec;
+            dn[il].attached = true;
+            if (l->rot_down.width != (uint32_t)l->ffn_down_exps->dim[0]) {
+                qwen4exp_die("lowbitflash.rot: blk.%u down rotation covers "
+                             "%u inputs but ffn_down_exps has %" PRIu64,
+                             il, l->rot_down.width,
+                             l->ffn_down_exps->dim[0]);
+            }
+        }
+        const bool rotated_layer = gu[il].seen || dn[il].seen;
+        if (!rotated_layer &&
+            (l->ffn_gate_exps->type == DS4_TENSOR_PQ2_0 ||
+             l->ffn_up_exps->type == DS4_TENSOR_PQ2_0 ||
+             l->ffn_down_exps->type == DS4_TENSOR_PQ2_0)) {
+            qwen4exp_die("blk.%u has PQ2_0 expert tensors but no "
+                         "lowbitflash.rot spec; the weights are stored in a "
+                         "rotated basis and cannot run unrotated", il);
+        }
+        if (gu[il].seen != dn[il].seen) {
+            qwen4exp_die("blk.%u carries a lowbitflash.rot spec for only %s "
+                         "side; both gate/up and down must be rotated "
+                         "together", il, gu[il].seen ? "one" : "neither");
+        }
+        w->has_lbf_rot = w->has_lbf_rot || rotated_layer;
+    }
+
+    free(gu);
+    free(dn);
+}
+
 /* Reachable from the DS4_TEST_HOOKS entry points below and from the engine
  * open path once L5 wires it; upstream marks the same shape of function with
  * DS4_MAYBE_UNUSED (see weights_model_map_sharded_spans in ds4.c). */
@@ -1277,6 +1551,11 @@ static DS4_MAYBE_UNUSED void weights_bind_qwen4exp(ds4_qwen4exp_weights *w, cons
     for (uint32_t il = 0; il < w->n_layer; il++) {
         weights_bind_qwen4exp_layer(&w->layer[il], m, plan, il);
     }
+
+    /* Activation rotations attach after the layer loop: a spec's width is
+     * checked against the bound tensor it claims to rotate, so the tensors
+     * must exist first.  Fatal on any malformed or half-covered table. */
+    qwen4exp_bind_lbf_rotations(w, m);
 
     for (int f = 0; f < DS4_QWEN4EXP_MEM_COUNT; f++) {
         plan->total_bytes += plan->bytes[f];

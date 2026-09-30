@@ -3346,6 +3346,22 @@ __device__ __forceinline__ static float dev_qwen4exp_q8_0_value(
     return dev_f16_to_f32(d) * (float)(int8_t)blk[2u + (k % 32u)];
 }
 
+/* lowbitFlash PQ2_0 (ggml type 142): 128 elements in 34 bytes -- a fp16
+ * group scale then 32 bytes of two-bit codes, element j at byte 2 + j/4,
+ * bits 2*(j%4), LSB first.  code is q + 1, so the value is (code - 1) * d;
+ * code 3 is unassigned by the quantizer but decodes as +2 * d, the same
+ * interpretation dequantize_row_pq2_0 in prism ggml-quants.c gives it. */
+__device__ __forceinline__ static float dev_qwen4exp_pq2_0_value(
+        const char *row, uint32_t k) {
+    const char *blk = row + (uint64_t)(k / 128u) * 34u;
+    const uint32_t j = k % 128u;
+    const uint16_t d = (uint16_t)((uint8_t)blk[0]) |
+                       (uint16_t)((uint16_t)(uint8_t)blk[1] << 8u);
+    const uint32_t code =
+        ((uint32_t)(uint8_t)blk[2u + (j >> 2u)] >> (2u * (j & 3u))) & 3u;
+    return ((float)code - 1.0f) * dev_f16_to_f32(d);
+}
+
 __device__ __forceinline__ static float dev_qwen4exp_f32_value(
         const char *row, uint32_t k) {
     return ((const float *)row)[k];
@@ -3771,6 +3787,45 @@ __device__ __forceinline__ static void dev_qwen4exp_group_decode(
             const uint32_t q = (quarter < 2u) ? ((lo & 0x0fu) | (hi << 4u))
                                               : ((lo >> 4u) | (hi << 4u));
             wq[i] = (int8_t)((int32_t)q - 32);
+        }
+        return;
+    }
+    case (uint32_t)DS4_QWEN4EXP_TY_pq2_0: {
+        /* 32 of a 128-element block's ternary codes.  Element j of the block
+         * sits at byte 2 + j/4 of the block, bits 2*(j%4), so one 32-group --
+         * elements base..base+31 with base a multiple of 32 -- occupies
+         * exactly the eight payload bytes qs[base/4 .. base/4 + 8): two whole
+         * words when the payload is aligned, each carrying sixteen 2-bit
+         * fields.  wq is the raw ternary {-1,0,1}; the fp16 group scale lands
+         * in wa and wb stays 0, the Q8_0 shape of the contract. */
+        const char *blk = row + (uint64_t)(g >> 2u) * 34u;
+        const uint16_t d = (uint16_t)((uint8_t)blk[0]) |
+                           (uint16_t)((uint16_t)(uint8_t)blk[1] << 8u);
+        wa[0] = dev_f16_to_f32(d);
+        const uint8_t *qs = (const uint8_t *)blk + 2u;
+        const uint32_t base = (g & 3u) * 32u;
+        if (qwen4exp_word_aligned(qs)) {
+            /* base>>4: the group's 8 payload bytes are two words, so a
+             * 32-element group advances the WORD pointer by base/16 = 2
+             * words, not by the byte count. */
+            const uint32_t *qw =
+                (const uint32_t *)(const void *)qs + (base >> 4u);
+#pragma unroll
+            for (int w = 0; w < 2; w++) {
+                const uint32_t v = qw[w];
+#pragma unroll
+                for (int e = 0; e < 16; e++) {
+                    wq[16 * w + e] =
+                        (int8_t)((int32_t)((v >> (2 * e)) & 3u) - 1);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < 32; i++) {
+                const uint32_t j = base + (uint32_t)i;
+                wq[i] = (int8_t)((int32_t)((qs[j >> 2u] >>
+                                            (2u * (j & 3u))) & 3u) - 1);
+            }
         }
         return;
     }
@@ -10001,6 +10056,189 @@ static int qwen4exp_quantize_rows(
     return cuda_ok(cudaGetLastError(), "qwen4exp activation quantise");
 }
 
+/* ===========================================================================
+ * lowbitFlash ROTATED-BASIS ACTIVATION PATH (lowbitflash.rot.*, contract v1).
+ *
+ * A rotated weight W_r stores rows pre-multiplied by Rbar = block-diag
+ * (D_b H_b), so the engine computes y = W_r (R x) with
+ * R = block-diag(H_b D_b): per input segment, apply the sign diagonal and
+ * the normalised Sylvester Walsh-Hadamard transform to the activation, THEN
+ * run the same Q8_0 group quantisation dev_qwen4exp_quantize_group performs
+ * for an unrotated row.  The dp4a group contract below it -- wq, wa, wb --
+ * never changes, which is what makes the whole thing one kernel: the
+ * quantiser's output contract is the only thing downstream kernels see.
+ *
+ * Kernel geometry.  ONE block handles one (row, segment) pair: the
+ * transform's butterfly wants the whole segment in one place, and the
+ * tower's segments are powers of two of 128..1024 -- one 256-thread block
+ * stages up to 1024 floats (4 KB) and runs the butterfly over shared
+ * memory.  Element k of the segment takes sign[k] * x[k] into the stage,
+ * log2(bs) butterfly rounds turn it into H_b (D_b x_b), the 1/sqrt(bs)
+ * factor lands on the way out, and the segment's groups of 32 feed the
+ * regular warp-synchronous quantiser -- so the scales, quants and sums are
+ * bit-for-bit the standalone kernel's for the same rotated floats, and the
+ * scratch layout it writes (xq/xs/xsum at row*groups+g) is unchanged.
+ *
+ * The PDL trigger replicates the standalone kernel's: this kernel is the
+ * programmatic producer for the same consumer launches, under the same
+ * total-blocks gate, so the grid-to-grid edges its callers rely on carry
+ * over unchanged. */
+
+typedef struct {
+    const float *signs;                       /* device, [width] fp32 +/-1 */
+    uint32_t     width;
+    uint32_t     n_seg;
+    uint32_t     seg_size[DS4_GPU_QWEN4EXP_ROT_MAX_SEG];
+} qw_lbf_rot_desc;
+
+#define QW_LBF_ROT_THREADS 256u
+
+__global__ static void qwen4exp_lbf_rot_quantize_kernel(
+        int8_t *xq, float *xs, int32_t *xsum,
+        const float *x, uint32_t width, uint32_t groups,
+        uint64_t outer_stride, uint64_t inner_stride, uint32_t inner_count,
+        const qw_lbf_rot_desc rot) {
+    if ((uint64_t)gridDim.x * (uint64_t)gridDim.y * (uint64_t)gridDim.z <=
+        768u)
+        QWEN4EXP_PDL_TRIGGER();
+
+    const uint32_t seg = blockIdx.x;
+    const uint32_t r = blockIdx.y;
+    if (seg >= rot.n_seg) return;
+
+    /* Segment boundaries from the size list; the loader already checked the
+     * sizes are powers of two, multiples of 128 and sum to width. */
+    uint32_t off = 0;
+    for (uint32_t i = 0; i < seg; i++) off += rot.seg_size[i];
+    const uint32_t bs = rot.seg_size[seg];
+    if (bs == 0 || bs > (uint32_t)QW_LBF_ROT_THREADS * 4u) return;
+
+    extern __shared__ float qw_lbf_sh[];
+
+    const uint32_t outer = r / inner_count;
+    const uint32_t inner = r - outer * inner_count;
+    const float *xr = x + (uint64_t)outer * outer_stride +
+                      (uint64_t)inner * inner_stride + off;
+    const float *sg = rot.signs + off;
+    const uint32_t tid = threadIdx.x;
+
+    for (uint32_t k = tid; k < bs; k += QW_LBF_ROT_THREADS)
+        qw_lbf_sh[k] = xr[k] * sg[k];
+    __syncthreads();
+
+    /* Unnormalised Sylvester butterfly: stage h pairs (i, i+h); after the
+     * last round the stage holds n * H (D x), and the 1/sqrt(bs) factor
+     * comes in below.  Both barriers stay inside the round so a reader never
+     * overtakes the previous round's writer. */
+    for (uint32_t h = 1u; h < bs; h <<= 1u) {
+        __syncthreads();
+        for (uint32_t i = tid; i < (bs >> 1u); i += QW_LBF_ROT_THREADS) {
+            const uint32_t lo = (i & ~(h - 1u)) << 1u;
+            const uint32_t idx = lo | (i & (h - 1u));
+            const float u = qw_lbf_sh[idx];
+            const float v = qw_lbf_sh[idx + h];
+            qw_lbf_sh[idx]     = u + v;
+            qw_lbf_sh[idx + h] = u - v;
+        }
+    }
+    __syncthreads();
+
+    /* Normalise the stage before the quantiser reads it: the butterfly ran
+     * unnormalised, so scale in place under one more barrier. */
+    const float norm = 1.0f / sqrtf((float)bs);
+    for (uint32_t k = tid; k < bs; k += QW_LBF_ROT_THREADS)
+        qw_lbf_sh[k] *= norm;
+    __syncthreads();
+
+    /* The segment's groups of 32 hand off to the same warp-synchronous
+     * quantiser the standalone kernel uses, one warp per group and as many
+     * passes of the block's eight warps as the segment needs (a 1024-wide
+     * segment is 32 groups, four rounds).  The scratch group index stays
+     * global (r * groups + g) whichever segment covered the group. */
+    const uint32_t seg_groups = bs >> 5u;
+    for (uint32_t w = tid >> 5u; w < seg_groups; w += 8u) {
+        const uint32_t g = (off >> 5u) + w;
+        dev_qwen4exp_quantize_group(xq, xs, xsum, qw_lbf_sh + w * 32u,
+                                    tid & 31u, 32u,
+                                    (uint64_t)r * groups + g);
+    }
+}
+
+/* Rotate + quantise `rows` rows of `width` floats, where row r starts at
+ * outer_stride * (r / inner_count) + inner_stride * (r % inner_count) -- the
+ * same addressing contract as qwen4exp_quantize_rows.  `rot` is the host copy
+ * of one layer's spec; its `signs` field is a device pointer.  Returns
+ * nonzero on launch success; refuses a malformed spec by name rather than
+ * emitting a wrong quantisation. */
+static int qwen4exp_lbf_rot_quantize_rows(
+        int8_t *xq, float *xs, int32_t *xsum, const float *src,
+        const qw_lbf_rot_desc *rot,
+        uint32_t rows, uint32_t width, uint32_t groups,
+        uint64_t outer_stride, uint64_t inner_stride, uint32_t inner_count,
+        cudaStream_t stream) {
+    if (!rot || !rot->signs || rot->n_seg == 0u ||
+        rot->n_seg > DS4_GPU_QWEN4EXP_ROT_MAX_SEG || rot->width != width ||
+        rows == 0u || width == 0u || (width & 31u) != 0u ||
+        groups * 32u != width) {
+        fprintf(stderr, "ds4: CUDA qwen4exp rotation spec does not cover "
+                        "the %u-wide row it was given\n", width);
+        return 0;
+    }
+    uint32_t sum = 0, max_bs = 0;
+    for (uint32_t i = 0; i < rot->n_seg; i++) {
+        const uint32_t bs = rot->seg_size[i];
+        if (bs < 128u || (bs & (bs - 1u)) != 0u ||
+            bs > (uint32_t)QW_LBF_ROT_THREADS * 4u) {
+            fprintf(stderr, "ds4: CUDA qwen4exp rotation segment %u is %u, "
+                            "not a supported power-of-two multiple of 128\n",
+                    i, bs);
+            return 0;
+        }
+        sum += bs;
+        if (bs > max_bs) max_bs = bs;
+    }
+    if (sum != width) {
+        fprintf(stderr, "ds4: CUDA qwen4exp rotation segments sum to %u, "
+                        "not the %u-wide row\n", sum, width);
+        return 0;
+    }
+
+    qwen4exp_lbf_rot_quantize_kernel<<<
+            dim3(rot->n_seg, rows, 1), QW_LBF_ROT_THREADS,
+            (size_t)max_bs * sizeof(float), stream>>>(
+            xq, xs, xsum, src, width, groups,
+            outer_stride, inner_stride, inner_count, *rot);
+    return cuda_ok(cudaGetLastError(), "qwen4exp rotation quantise");
+}
+
+/* The public handle for the kernel-level test: one call = one rotated
+ * quantisation on the decode stream, same semantics as the internal helper
+ * with the ds4_gpu_qwen4exp_rot_in spelling of the spec. */
+extern "C" int ds4_gpu_qwen4exp_lbf_rot_quantize(
+        int8_t                        *xq,
+        float                         *xs,
+        int32_t                       *xsum,
+        const float                   *src,
+        const ds4_gpu_qwen4exp_rot_in *rot_in,
+        uint32_t                       rows,
+        uint32_t                       width,
+        uint64_t                       outer_stride,
+        uint64_t                       inner_stride,
+        uint32_t                       inner_count) {
+    if (!xq || !xs || !xsum || !src || !rot_in) return 0;
+    qw_lbf_rot_desc rot;
+    memset(&rot, 0, sizeof(rot));
+    rot.signs = rot_in->signs;
+    rot.width = rot_in->width;
+    rot.n_seg = rot_in->n_seg;
+    for (uint32_t i = 0; i < rot_in->n_seg &&
+             i < DS4_GPU_QWEN4EXP_ROT_MAX_SEG; i++)
+        rot.seg_size[i] = rot_in->seg_size[i];
+    return qwen4exp_lbf_rot_quantize_rows(
+            xq, xs, xsum, src, &rot, rows, width, width / 32u,
+            outer_stride, inner_stride, inner_count, cuda_decode_stream());
+}
+
 /* The row tile changes work sharing, not the arithmetic of a live row.
  * DS4_QWEN4EXP_MOE_R pins the tile for direct comparison of the variants. */
 static int qwen4exp_moe_tile(uint32_t n_rows) {
@@ -10084,7 +10322,8 @@ static int qwen4exp_routed_moe_cuda(
         uint32_t                     n_tokens,
         uint32_t                     mid_token_stride,
         const ds4_gpu_tensor        *logits,
-        ds4_gpu_tensor              *weights_rw) {
+        ds4_gpu_tensor              *weights_rw,
+        const ds4_gpu_qwen4exp_rot  *rot) {
     if (!out || !mid || !gate_slab || !up_slab || !down_slab ||
         !gate_slab->map || !up_slab->map || !down_slab->map ||
         !selected || !weights || !x ||
@@ -10124,6 +10363,33 @@ static int qwen4exp_routed_moe_cuda(
         weights->bytes < (uint64_t)n_tokens * n_expert_used * sizeof(float)) {
         fprintf(stderr, "ds4: CUDA qwen4exp MoE received undersized buffers\n");
         return 0;
+    }
+
+    /* lowbitflash.rot.* for this layer, or both descriptors empty.  `in`
+     * rotates the shared expert input before its quantisation; `mid`
+     * rotates the gate/up intermediate before the down projection's
+     * quantisation.  A spec is live only when it carries a sign pointer
+     * AND a segment list, so a half-filled layer struct cannot reach a
+     * kernel half-applied. */
+    qw_lbf_rot_desc rot_in, rot_mid;
+    memset(&rot_in, 0, sizeof(rot_in));
+    memset(&rot_mid, 0, sizeof(rot_mid));
+    int has_rot_in = 0, has_rot_mid = 0;
+    if (rot) {
+        rot_in.signs  = rot->in.signs;
+        rot_in.width  = rot->in.width;
+        rot_in.n_seg  = rot->in.n_seg;
+        for (uint32_t i = 0; i < rot->in.n_seg &&
+                 i < DS4_GPU_QWEN4EXP_ROT_MAX_SEG; i++)
+            rot_in.seg_size[i] = rot->in.seg_size[i];
+        rot_mid.signs  = rot->mid.signs;
+        rot_mid.width  = rot->mid.width;
+        rot_mid.n_seg  = rot->mid.n_seg;
+        for (uint32_t i = 0; i < rot->mid.n_seg &&
+                 i < DS4_GPU_QWEN4EXP_ROT_MAX_SEG; i++)
+            rot_mid.seg_size[i] = rot->mid.seg_size[i];
+        has_rot_in  = rot_in.signs != NULL && rot_in.n_seg > 0u;
+        has_rot_mid = rot_mid.signs != NULL && rot_mid.n_seg > 0u;
     }
 
     /* Each slab resolves through its OWN mapping: one block's expert tensors
@@ -10360,19 +10626,35 @@ static int qwen4exp_routed_moe_cuda(
      * rather than silently dropped.
      *
      * DS4_QWEN4EXP_NO_MOE_PREQUANT stands the whole thing down. */
+    /* When the input rotation is live the mixer-folded xq can never serve
+     * this call: the fold stores the UNROTATED row's quantisation, and the
+     * shared expert reads its own copy of `x`, not this scratch.  Skip the
+     * arm check entirely so a stale fold is consumed-and-dropped, never
+     * matched. */
     int preq_taken = 0;
-    if (logical_tier >= 0 && logical_tier < 16) {
+    if (!has_rot_in && logical_tier >= 0 && logical_tier < 16) {
         qwen4exp_preq_arm *pa = &g_qwen4exp_preq_arm[logical_tier];
         if (pa->armed) {
             pa->armed = 0;
-            if (pa->x == (const void *)x->ptr &&
+            if (!has_rot_in &&
+                pa->x == (const void *)x->ptr &&
                 pa->base == (const void *)sc.xq &&
                 pa->rows == n_tokens && pa->xgroups == xgroups) {
                 preq_taken = 1;
             }
         }
     }
-    if (!preq_taken &&
+    if (has_rot_in) {
+        /* Rotated input basis: one fused launch replaces this quantise.  It
+         * writes the identical xq/xs/xsum layout, so every downstream arm --
+         * dp4a, MMA, panels -- reads the rotated activation without knowing
+         * the basis changed. */
+        if (!qwen4exp_lbf_rot_quantize_rows(
+                sc.xq, sc.xs, sc.xsum, (const float *)x->ptr, &rot_in,
+                n_tokens, in_dim, xgroups, in_dim, 0, 1, stream)) {
+            return 0;
+        }
+    } else if (!preq_taken &&
         !qwen4exp_quantize_rows(sc.xq, sc.xs, sc.xsum, (const float *)x->ptr,
                                 n_tokens, in_dim, xgroups, in_dim, 0, 1,
                                 stream)) {
@@ -10381,15 +10663,24 @@ static int qwen4exp_routed_moe_cuda(
     /* Publish the layout for the NEXT layer's FFN mixer.  Unconditional: the
      * mixer re-validates every field against the pool as it stands when IT
      * runs, so publishing after a fold that was taken is what keeps the fold
-     * live layer after layer. */
-    qwen4exp_preq_publish(logical_tier, (const void *)x->ptr,
-                          (const void *)sc.xq, n_tokens, xgroups);
+     * live layer after layer.  When the input rotation is live the scratch
+     * holds ROTATED quants; publishing would let the shared expert or the
+     * next fold consume them as primal-basis values, so the publish is
+     * skipped and the fold naturally un-arms. */
+    if (!has_rot_in)
+        qwen4exp_preq_publish(logical_tier, (const void *)x->ptr,
+                              (const void *)sc.xq, n_tokens, xgroups);
 
     /* The shared-expert fork's first event: the quantized activation the
      * shared gate/up needs is complete here, and nothing below writes the
      * prefix it lives in.  A failed record leaves the shared call in stream
-     * order (qwen4exp_fork_ready, above the routed entry). */
-    if (logical_tier >= 0 && logical_tier < 16) {
+     * order (qwen4exp_fork_ready, above the routed entry).
+     *
+     * Skipped when the input rotation is live: the scratch then holds the
+     * ROTATED quantisation, and the shared expert's projections are
+     * primal-basis weights that must re-quantise `x` themselves.  Arming the
+     * fork would feed them rotated bytes, so the event record never runs. */
+    if (!has_rot_in && logical_tier >= 0 && logical_tier < 16) {
         qwen4exp_fork_arm *arm = &g_qwen4exp_fork_arm[logical_tier];
         arm->armed = 0;
         if (qwen4exp_shared_fork_on() &&
@@ -10439,7 +10730,11 @@ static int qwen4exp_routed_moe_cuda(
      * the standalone quantise must keep running there. */
     const int down_mma = use_mma && (out_dim % QW_DOWN_MMA_BM) == 0 &&
                          down_slab->type != (uint32_t)DS4_QWEN4EXP_TY_q6_K;
-    const int moe_epilogue = down_mma &&
+    /* The fused gate/up epilogue writes the UNROTATED mid's quantisation
+     * straight into the down scratch, so a live mid rotation excludes it:
+     * the standalone pass below is the one that applies R.  down_mma itself
+     * stays usable -- it consumes mq/ms/msum, not mid floats. */
+    const int moe_epilogue = down_mma && !has_rot_mid &&
         getenv("DS4_QWEN4EXP_NO_MOE_EPILOGUE") == NULL;
 
     /* K-CHUNK-MAJOR SCRATCH LAYOUT (qw_moe_kc_index).  Only on the
@@ -10786,8 +11081,17 @@ static int qwen4exp_routed_moe_cuda(
     if (!cuda_ok(cudaGetLastError(), "qwen4exp MoE gate/up launch")) return 0;
 
     /* The fused epilogue already quantised the live pairs' groups straight
-     * into the scratch the down tile reads. */
-    if (!moe_epilogue &&
+     * into the scratch the down tile reads -- except when the mid rotation
+     * is live, where the epilogue was never armed and the standalone pass
+     * below carries the rotation. */
+    if (!moe_epilogue && has_rot_mid) {
+        if (!qwen4exp_lbf_rot_quantize_rows(
+                sc.mq, sc.ms, sc.msum, (const float *)mid->ptr, &rot_mid,
+                n_pairs, mid_dim, mgroups, mid_token_stride,
+                mid_dim, n_expert_used, stream)) {
+            return 0;
+        }
+    } else if (!moe_epilogue &&
         !qwen4exp_quantize_rows(sc.mq, sc.ms, sc.msum, (const float *)mid->ptr,
                                 n_pairs, mid_dim, mgroups, mid_token_stride,
                                 mid_dim, n_expert_used, stream)) {
@@ -10966,7 +11270,8 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_tensor(
         const ds4_gpu_tensor        *x,
         uint32_t                     n_tokens,
         uint32_t                     mid_token_stride) {
-    return qwen4exp_routed_moe_cuda(DS4_QWEN4EXP_ROUTED_MOE_ARGS, NULL, NULL);
+    return qwen4exp_routed_moe_cuda(DS4_QWEN4EXP_ROUTED_MOE_ARGS, NULL, NULL,
+                                    NULL);
 }
 
 /* The same block with the router's selection folded into its grouping launch.
@@ -10991,7 +11296,33 @@ extern "C" int ds4_gpu_qwen4exp_routed_moe_router_tensor(
         const ds4_gpu_tensor        *logits,
         ds4_gpu_tensor              *weights_rw) {
     return qwen4exp_routed_moe_cuda(DS4_QWEN4EXP_ROUTED_MOE_ARGS, logits,
-                                    weights_rw);
+                                    weights_rw, NULL);
+}
+
+/* The routed block with the layer's lowbitflash activation rotations.
+ * `rot` NULL is the call above exactly: the same launches, byte for byte. */
+extern "C" int ds4_gpu_qwen4exp_routed_moe_router_rot_tensor(
+        ds4_gpu_tensor              *out,
+        ds4_gpu_tensor              *mid,
+        ds4_gpu_tensor              *down_partial,
+        const ds4_gpu_qwen4exp_slab *gate_slab,
+        const ds4_gpu_qwen4exp_slab *up_slab,
+        const ds4_gpu_qwen4exp_slab *down_slab,
+        uint32_t                     in_dim,
+        uint32_t                     mid_dim,
+        uint32_t                     out_dim,
+        const ds4_gpu_tensor        *selected,
+        const ds4_gpu_tensor        *weights,
+        uint32_t                     n_total_expert,
+        uint32_t                     n_expert_used,
+        const ds4_gpu_tensor        *x,
+        uint32_t                     n_tokens,
+        uint32_t                     mid_token_stride,
+        const ds4_gpu_tensor        *logits,
+        ds4_gpu_tensor              *weights_rw,
+        const ds4_gpu_qwen4exp_rot  *rot) {
+    return qwen4exp_routed_moe_cuda(DS4_QWEN4EXP_ROUTED_MOE_ARGS, logits,
+                                    weights_rw, rot);
 }
 #undef DS4_QWEN4EXP_ROUTED_MOE_ARGS
 
