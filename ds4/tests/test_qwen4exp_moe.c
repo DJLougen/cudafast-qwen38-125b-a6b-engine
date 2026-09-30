@@ -2073,6 +2073,8 @@ typedef struct {
 } moe_reuse_case;
 
 static void moe_reuse_chain(moe_reuse_case *c, int reuse) {
+    fprintf(stderr, "DBG chain reuse=%d rows=%u gate=%u\n", reuse, c->rows, c->gate.type);
+    fflush(stderr);
     require_ok(ds4_gpu_qwen4exp_routed_moe_tensor(
                    c->t[0], c->routed_mid, c->partial,
                    &c->gate, &c->up, &c->down,
