@@ -247,17 +247,17 @@ int main(void) {
     /* Case shapes mirror the production contract: the routed input is
      * 2560 wide with inner_count 1; the mid scratch carries per-(token,
      * expert-slot) rows with outer_stride = token span and
-     * inner_stride = mid_dim.  Segmentations: a production-like tower,
-     * a single block, and an odd four-segment split to prove boundaries. */
+     * inner_stride = mid_dim.  Segmentations must be power-of-two multiples
+     * of 128 -- the contract refuses anything else, and so must this test:
+     * a single 2560 segment is malformed (2560 is not a power of two) and
+     * is covered by the refusal checks below instead. */
     static const uint32_t segs_in[]   = { 1024, 1024, 512 };
-    static const uint32_t segs_one[]  = { 2560 };
     static const uint32_t segs_odd[]  = { 512, 256, 1024, 512, 256 };
     static const uint32_t segs_mid[]  = { 512, 128 };
     static const uint32_t segs_mid2[] = { 256, 256, 128 };
 
     run_case("in-2560 tower x1 row", 1, 2560, segs_in, 3, 2560, 0, 1, 0);
     run_case("in-2560 tower x2 rows", 2, 2560, segs_in, 3, 2560, 0, 1, 0);
-    run_case("in-2560 single seg", 1, 2560, segs_one, 1, 2560, 0, 1, 0);
     run_case("in-2560 five segs x3", 3, 2560, segs_odd, 5, 2560, 0, 1, 0);
     /* Mid path: 20 (token,expert) pairs over 2 tokens, 10 experts wide --
      * row r lives at outer_stride*(r/10) + 640*(r%10), exactly the scratch
