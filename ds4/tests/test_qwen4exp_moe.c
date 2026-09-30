@@ -2135,6 +2135,8 @@ static void run_moe_input_reuse_case(
         const bool capture = c.rows <= 7u || c.rows == 64u;
 #endif
         for (unsigned pattern = 0; pattern < 3; pattern++) {
+            fprintf(stderr, "DBG reuse w=%u pat=%u eager\n", c.rows, pattern);
+            fflush(stderr);
             for (size_t i = 0; i < xn; i++) x[i] = rng_unit() * magnitudes[pattern];
             for (size_t i = 0; i < sn; i++) {
                 ids[i] = (int32_t)((i + pattern) % PROD_EXPERTS);
