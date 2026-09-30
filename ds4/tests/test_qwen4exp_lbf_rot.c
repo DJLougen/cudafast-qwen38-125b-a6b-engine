@@ -21,8 +21,8 @@
  * Run it on a CUDA host:  ./tests/test_qwen4exp_lbf_rot
  */
 
+#include <inttypes.h>
 #include <math.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
