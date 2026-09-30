@@ -108,7 +108,10 @@ static int run_case(const char *name,
 
     /* Deterministic input and signs: a cheap LCG over row*width, so every
      * element and every segment boundary gets a distinct magnitude. */
-    float *x = malloc((size_t)rows * width * sizeof(float));
+    /* Rows are addressed by strides, so the buffer spans rows *
+     * outer_stride, not rows * width: outer_stride can exceed width when a
+     * token carries several inner rows (the (token,expert) mid layout). */
+    float *x = malloc((size_t)rows * outer_stride * sizeof(float));
     float *signs = malloc((size_t)width * sizeof(float));
     int32_t *isigns = malloc((size_t)width * sizeof(int32_t));
     require(x && signs && isigns, "host alloc");
