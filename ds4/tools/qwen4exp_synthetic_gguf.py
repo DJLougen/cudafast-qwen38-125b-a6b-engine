@@ -135,6 +135,10 @@ TYPES = {
     "IQ4_NL": (20,  32,  18),
     "IQ4_XS": (23, 256, 136),
     "BF16":   (30,   1,   2),
+    # lowbitFlash ternary: 128 values in 34 bytes (fp16 scale + 32 two-bit
+    # quads), GGUF/ggml type 142.  The rotated-basis metadata it needs is a
+    # set of lowbitflash.rot.* KVs, emitted via --kv-set/--kv-set-array.
+    "PQ2_0":  (142, 128,  34),
 }
 
 
@@ -230,6 +234,10 @@ def blk_iq4_xs(rng):
     return scale(rng, 127 * 32) + rng.randbytes(2 + 4 + 128)
 
 
+def blk_pq2_0(rng):
+    # fp16 scale + 32 packed two-bit codes; contents are arbitrary, only the
+    # byte contract matters to the loader.
+    return scale(rng, 4) + rng.randbytes(32)
 BLOCKS = {
     "Q4_0": blk_q4_0, "Q4_1": blk_q4_1,
     "Q5_0": blk_q5_0, "Q5_1": blk_q5_1,
@@ -237,6 +245,7 @@ BLOCKS = {
     "Q2_K": blk_q2_k, "Q3_K": blk_q3_k, "Q4_K": blk_q4_k,
     "Q5_K": blk_q5_k, "Q6_K": blk_q6_k,
     "IQ4_NL": blk_iq4_nl, "IQ4_XS": blk_iq4_xs,
+    "PQ2_0": blk_pq2_0,
 }
 
 
@@ -811,7 +820,9 @@ def parse_kv_set_array(spec):
         return (key, V_U32, [int(x) for x in items])
     if kind == "U64":
         return (key, V_U64, [int(x) for x in items])
-    raise SystemExit("unknown array kind %r (use I32/U32/U64)" % kind)
+    if kind == "STR":
+        return (key, V_STRING, items)
+    raise SystemExit("unknown array kind %r (use I32/U32/U64/STR)" % kind)
 
 
 def apply_faults(tensors, args):

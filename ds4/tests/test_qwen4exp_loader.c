@@ -51,6 +51,8 @@ uint64_t ds4_qwen4exp_test_shard_order(const char *path, uint32_t *out,
 void ds4_qwen4exp_test_set_free_memory_override(uint64_t bytes, bool enable);
 void ds4_qwen4exp_test_open_mtp(const char *path, uint64_t *bound_out,
                                 uint64_t *n_tensors_out, uint64_t *bytes_out);
+void ds4_qwen4exp_test_rot_masks(const char *path, uint64_t *gate_up_out,
+                                 uint64_t *down_out, int *has_rot_out);
 
 static int g_failures;
 static int g_checks;
@@ -382,6 +384,43 @@ int main(int argc, char **argv) {
     join(p, sizeof(p), dir, "badkv_schedule/"); strcat(p, shard1);
     run_child(p, "compress ratio", true, -1,
               "the attention schedule disagrees with the interval rule");
+    /* ---------------------------------------------------------------- */
+    printf("ROT: lowbitflash.rot.* binding, positive and fail-closed\n");
+
+    /* Positive: rot_ok has all of blk.0's experts retyped PQ2_0 with full
+     * gate/up+down specs; the mask hook must report layer 0 on both sides
+     * and has_lbf_rot set, nothing else. */
+    {
+        char rotp[4096];
+        join(rotp, sizeof(rotp), dir, "rot_ok/qw4x-00001-of-00003.gguf");
+        uint64_t gu = 0, dn = 0;
+        int has_rot = -1;
+        ds4_qwen4exp_test_rot_masks(rotp, &gu, &dn, &has_rot);
+        check_eq_u64(gu, 1ull, "rot_ok attaches gate/up spec to blk.0 only");
+        check_eq_u64(dn, 1ull, "rot_ok attaches down spec to blk.0 only");
+        check(has_rot == 1, "rot_ok sets has_lbf_rot");
+    }
+
+    /* Each malformed file must die by name. */
+    join(p, sizeof(p), dir, "badrot_version/"); strcat(p, shard1);
+    run_child(p, "unsupported lowbitflash.rot.version", true, -1,
+              "rotation version 2 is refused");
+
+    join(p, sizeof(p), dir, "badrot_keyonly/"); strcat(p, shard1);
+    run_child(p, "version is missing", true, -1,
+              "rot keys without a version are refused");
+
+    join(p, sizeof(p), dir, "badrot_name/"); strcat(p, shard1);
+    run_child(p, "not a routed", true, -1,
+              "a non-expert weight name is refused");
+
+    join(p, sizeof(p), dir, "badrot_nospec/"); strcat(p, shard1);
+    run_child(p, "PQ2_0 expert tensors but no", true, -1,
+              "PQ2_0 without a spec is refused");
+
+    join(p, sizeof(p), dir, "badrot_oneside/"); strcat(p, shard1);
+    run_child(p, "rotated together", true, -1,
+              "gate/up-only coverage is refused");
 
     /* ---------------------------------------------------------------- */
     printf("MEMORY SAFETY: refuse when free memory cannot hold the model\n");
