@@ -10628,11 +10628,12 @@ static int qwen4exp_routed_moe_cuda(
      * DS4_QWEN4EXP_NO_MOE_PREQUANT stands the whole thing down. */
     /* When the input rotation is live the mixer-folded xq can never serve
      * this call: the fold stores the UNROTATED row's quantisation, and the
-     * shared expert reads its own copy of `x`, not this scratch.  Skip the
-     * arm check entirely so a stale fold is consumed-and-dropped, never
-     * matched. */
+     * shared expert reads its own copy of `x`, not this scratch.  The arm
+     * is still consumed unconditionally -- a pending fold must not survive
+     * a rotated call into the NEXT unrotated one, whose x pointer could
+     * coincidentally match. */
     int preq_taken = 0;
-    if (!has_rot_in && logical_tier >= 0 && logical_tier < 16) {
+    if (logical_tier >= 0 && logical_tier < 16) {
         qwen4exp_preq_arm *pa = &g_qwen4exp_preq_arm[logical_tier];
         if (pa->armed) {
             pa->armed = 0;
@@ -10680,10 +10681,11 @@ static int qwen4exp_routed_moe_cuda(
      * ROTATED quantisation, and the shared expert's projections are
      * primal-basis weights that must re-quantise `x` themselves.  Arming the
      * fork would feed them rotated bytes, so the event record never runs. */
-    if (!has_rot_in && logical_tier >= 0 && logical_tier < 16) {
+    if (logical_tier >= 0 && logical_tier < 16) {
         qwen4exp_fork_arm *arm = &g_qwen4exp_fork_arm[logical_tier];
         arm->armed = 0;
-        if (qwen4exp_shared_fork_on() &&
+        if (!has_rot_in &&
+            qwen4exp_shared_fork_on() &&
             qwen4exp_fork_ready(logical_tier, stream)) {
             if (cudaEventRecord(g_qwen4exp_fork_xq_ready[logical_tier],
                                 stream) == cudaSuccess) {
