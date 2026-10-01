@@ -6945,6 +6945,14 @@ typedef enum {
     DSML_TOOL_PARAM_VALUE,
     DSML_TOOL_DONE,
     DSML_TOOL_ERROR,
+    /* qwen4exp ChatML calls are "<tool_call>" blocks holding
+     * "<function=NAME>" and "<parameter=K>V</parameter>" pairs; they share the
+     * stream struct but need their own states because the tag set differs. */
+    DSML_TOOL_Q4E_FUNCTION,
+    DSML_TOOL_Q4E_PARAMS,
+    DSML_TOOL_Q4E_PARAM_VALUE,
+    DSML_TOOL_Q4E_END_CALL,
+    DSML_TOOL_Q4E_BETWEEN_CALLS,
 } dsml_tool_stream_state;
 
 /* Shared states for protocol-specific DSML stream projections.  The model
@@ -6964,6 +6972,8 @@ typedef struct {
     bool args_open;
     bool first_param;
     bool param_is_string;
+    bool qwen4exp;
+    bool value_started;
     char **ids;
     int ids_cap;
 } openai_tool_stream;
@@ -7574,7 +7584,8 @@ static bool openai_tool_emit_param_prefix(int fd, const request *r, const char *
     return ok;
 }
 
-static bool openai_tool_stream_init(openai_tool_stream *ts, const char *raw,
+static bool openai_tool_stream_init(openai_tool_stream *ts, const request *r,
+                                    const char *raw,
                                     size_t raw_len, size_t pos) {
     openai_tool_stream_free(ts);
     memset(ts, 0, sizeof(*ts));
@@ -7602,6 +7613,16 @@ static bool openai_tool_stream_init(openai_tool_stream *ts, const char *raw,
         ts->invoke_end = "</invoke>";
         ts->param_start = "<parameter";
         ts->param_end = "</parameter>";
+    } else if (r && r->model_syntax == SERVER_MODEL_SYNTAX_QWEN4EXP &&
+               getenv("DS4_SERVER_NO_TOOL_STREAM") == NULL &&
+               raw_full_lit(raw, raw_len, pos, "<tool_call>")) {
+        /* qwen4exp ChatML "<tool_call>\n<function=NAME>\n..." blocks are
+         * projected by qwen4exp_tool_stream_update().  DS4_SERVER_NO_TOOL_STREAM
+         * restores the old behaviour: suppress the stream and let
+         * openai_sse_finish_live() emit the whole call in one final chunk. */
+        ts->qwen4exp = true;
+        ts->state = DSML_TOOL_Q4E_FUNCTION;
+        ts->parse_pos += strlen("<tool_call>");
     } else {
         ts->active = false;
         ts->state = DSML_TOOL_ERROR;
@@ -7684,9 +7705,244 @@ static bool openai_tool_finish_param(int fd, const request *r, const char *id,
     return true;
 }
 
+/* qwen4exp projects sampled "<tool_call>\n<function=NAME>\n<parameter=K>\nV\n
+ * </parameter>\n</function>\n</tool_call>" blocks into tool_call deltas.  The
+ * batch parser (parse_qwen4exp_generated_message_ex) treats every parameter
+ * value as a JSON string after trim_const_span, so the streamed arguments are
+ * "{\"K\":\"" followed by escaped value bytes; the concatenation of all
+ * fragments equals the final arguments object byte-for-byte.  Tool markup is
+ * never unescaped here: the batch parser keeps entity escapes verbatim, so we
+ * do too. */
+
+static bool qwen4exp_tool_emit_value(int fd, const request *r, const char *id,
+                                     openai_tool_stream *ts,
+                                     const char *text, size_t len) {
+    if (len == 0) return true;
+    buf frag = {0};
+    json_escape_fragment_n(&frag, text, len);
+    bool ok = openai_tool_emit_args_fragment(fd, r, id, ts,
+                                           frag.ptr ? frag.ptr : "", frag.len);
+    buf_free(&frag);
+    return ok;
+}
+
+/* "<function=NAME>": emit the tool_calls header chunk plus the opening "{" of
+ * the arguments object.  The name is complete at '>', so it always goes out in
+ * one piece. */
+static bool qwen4exp_tool_start_function(int fd, server *s, const request *r,
+                                         const char *id, openai_tool_stream *ts,
+                                         const char *raw, size_t raw_len) {
+    const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
+    if (!tag_end) return true;
+    char *name = xstrndup(raw + ts->parse_pos,
+                          (size_t)(tag_end - (raw + ts->parse_pos)));
+    const char *tool_id = openai_tool_stream_id(s, ts, ts->index);
+    bool ok = sse_chat_tool_call_start_delta(fd, r, id, ts->index, tool_id, name) &&
+              openai_tool_emit_args_fragment(fd, r, id, ts, "{", 1);
+    free(name);
+    if (!ok) return false;
+
+    ts->emitted_any = true;
+    ts->args_open = true;
+    ts->first_param = true;
+    ts->parse_pos = (size_t)(tag_end - raw) + 1;
+    ts->state = DSML_TOOL_Q4E_PARAMS;
+    return true;
+}
+
+/* "<parameter=K>": emit '"K":"'.  A '>' inside the key terminates the tag just
+ * like the batch parser's strchr(p, '>'). */
+static bool qwen4exp_tool_start_param(int fd, const request *r, const char *id,
+                                      openai_tool_stream *ts,
+                                      const char *raw, size_t raw_len) {
+    const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
+    if (!tag_end) return true;
+    char *name = xstrndup(raw + ts->parse_pos,
+                          (size_t)(tag_end - (raw + ts->parse_pos)));
+    bool ok = openai_tool_emit_param_prefix(fd, r, id, ts, name, true);
+    free(name);
+    if (!ok) return false;
+
+    ts->value_started = false;
+    ts->parse_pos = (size_t)(tag_end - raw) + 1;
+    ts->state = DSML_TOOL_Q4E_PARAM_VALUE;
+    return true;
+}
+
+/* Value end at "</parameter>": emit the trimmed remainder plus the closing
+ * quote, matching trim_const_span in the batch parser. */
+static bool qwen4exp_tool_finish_param(int fd, const request *r, const char *id,
+                                       openai_tool_stream *ts,
+                                       const char *raw, size_t value_end) {
+    const char *vs = raw + ts->parse_pos;
+    const char *ve = raw + value_end;
+    trim_const_span(&vs, &ve);
+    if (ve > vs &&
+        !qwen4exp_tool_emit_value(fd, r, id, ts, vs, (size_t)(ve - vs))) {
+        return false;
+    }
+    if (!openai_tool_emit_args_fragment(fd, r, id, ts, "\"", 1)) return false;
+    ts->parse_pos = value_end + strlen("</parameter>");
+    ts->value_started = false;
+    ts->state = DSML_TOOL_Q4E_PARAMS;
+    return true;
+}
+
+static bool qwen4exp_tool_stream_update(int fd, server *s, const request *r,
+                                        const char *id, openai_tool_stream *ts,
+                                        const char *raw, size_t raw_len) {
+    static const char tool_start[] = "<tool_call>";
+    static const char tool_end[] = "</tool_call>";
+    static const char func_start[] = "<function=";
+    static const char func_end[] = "</function>";
+    static const char param_start[] = "<parameter=";
+    static const char param_end[] = "</parameter>";
+
+    while (ts->active && ts->parse_pos < raw_len) {
+        if (ts->state == DSML_TOOL_Q4E_FUNCTION) {
+            while (ts->parse_pos < raw_len &&
+                   isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
+            if (ts->parse_pos >= raw_len) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, func_start)) {
+                ts->parse_pos += strlen(func_start);
+                size_t before_pos = ts->parse_pos;
+                dsml_tool_stream_state before_state = ts->state;
+                if (!qwen4exp_tool_start_function(fd, s, r, id, ts, raw, raw_len)) {
+                    return false;
+                }
+                if (ts->parse_pos == before_pos && ts->state == before_state) {
+                    return true;
+                }
+                continue;
+            }
+            if (raw_partial_lit(raw, raw_len, ts->parse_pos, func_start) ||
+                raw_partial_lit(raw, raw_len, ts->parse_pos, tool_end)) {
+                return true;
+            }
+            /* "</tool_call>" without a function, or junk: the batch parser
+             * fails the same text, so suppress and let the finish path decide. */
+            return openai_tool_stream_fail(ts);
+        }
+
+        if (ts->state == DSML_TOOL_Q4E_PARAMS) {
+            while (ts->parse_pos < raw_len &&
+                   isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
+            if (ts->parse_pos >= raw_len) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, func_end)) {
+                if (ts->args_open &&
+                    !openai_tool_emit_args_fragment(fd, r, id, ts, "}", 1)) {
+                    return false;
+                }
+                ts->args_open = false;
+                ts->parse_pos += strlen(func_end);
+                ts->state = DSML_TOOL_Q4E_END_CALL;
+                continue;
+            }
+            if (raw_partial_lit(raw, raw_len, ts->parse_pos, func_end) ||
+                raw_partial_lit(raw, raw_len, ts->parse_pos, param_start)) {
+                return true;
+            }
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, param_start)) {
+                ts->parse_pos += strlen(param_start);
+                size_t before_pos = ts->parse_pos;
+                dsml_tool_stream_state before_state = ts->state;
+                if (!qwen4exp_tool_start_param(fd, r, id, ts, raw, raw_len)) {
+                    return false;
+                }
+                if (ts->parse_pos == before_pos && ts->state == before_state) {
+                    return true;
+                }
+                continue;
+            }
+            return openai_tool_stream_fail(ts);
+        }
+
+        if (ts->state == DSML_TOOL_Q4E_PARAM_VALUE) {
+            if (!ts->value_started) {
+                while (ts->parse_pos < raw_len &&
+                       isspace((unsigned char)raw[ts->parse_pos])) {
+                    ts->parse_pos++;
+                }
+                if (ts->parse_pos >= raw_len) return true;
+            }
+            const char *end = find_lit_bounded(raw + ts->parse_pos,
+                                               raw_len - ts->parse_pos,
+                                               param_end);
+            if (end) {
+                if (!qwen4exp_tool_finish_param(fd, r, id, ts, raw,
+                                              (size_t)(end - raw))) {
+                    return false;
+                }
+                continue;
+            }
+            size_t limit = tool_param_value_stream_safe_len(raw, ts->parse_pos,
+                                                            raw_len, param_end,
+                                                            false);
+            /* The batch parser trims trailing whitespace inside the value, so
+             * a whitespace tail is held until a non-space byte proves it is
+             * interior, or "</parameter>" makes it disappear entirely. */
+            while (limit > ts->parse_pos &&
+                   isspace((unsigned char)raw[limit - 1])) {
+                limit--;
+            }
+            if (limit > ts->parse_pos) {
+                ts->value_started = true;
+                if (!qwen4exp_tool_emit_value(fd, r, id, ts,
+                                              raw + ts->parse_pos,
+                                              limit - ts->parse_pos)) {
+                    return false;
+                }
+                ts->parse_pos = limit;
+            }
+            return true;
+        }
+
+        if (ts->state == DSML_TOOL_Q4E_END_CALL) {
+            while (ts->parse_pos < raw_len &&
+                   isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
+            if (ts->parse_pos >= raw_len) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, tool_end)) {
+                ts->parse_pos += strlen(tool_end);
+                ts->index++;
+                ts->state = DSML_TOOL_Q4E_BETWEEN_CALLS;
+                continue;
+            }
+            if (raw_partial_lit(raw, raw_len, ts->parse_pos, tool_end)) {
+                return true;
+            }
+            return openai_tool_stream_fail(ts);
+        }
+
+        if (ts->state == DSML_TOOL_Q4E_BETWEEN_CALLS) {
+            while (ts->parse_pos < raw_len &&
+                   isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
+            if (ts->parse_pos >= raw_len) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, tool_start)) {
+                ts->parse_pos += strlen(tool_start);
+                ts->state = DSML_TOOL_Q4E_FUNCTION;
+                continue;
+            }
+            if (raw_partial_lit(raw, raw_len, ts->parse_pos, tool_start)) {
+                return true;
+            }
+            /* Trailing text after the last call is not part of the message;
+             * the batch parser ignores it too. */
+            ts->active = false;
+            ts->state = DSML_TOOL_DONE;
+            return true;
+        }
+
+        return true;
+    }
+    return true;
+}
+
 static bool openai_tool_stream_update(int fd, server *s, const request *r, const char *id,
                                       openai_tool_stream *ts,
                                       const char *raw, size_t raw_len) {
+    if (ts->qwen4exp) {
+        return qwen4exp_tool_stream_update(fd, s, r, id, ts, raw, raw_len);
+    }
     while (ts->active && ts->parse_pos < raw_len) {
         if (ts->state == DSML_TOOL_BETWEEN_INVOKES) {
             while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
@@ -7861,7 +8117,7 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
 
         if (tool) {
             st->emit_pos = (size_t)(tool - raw);
-            if (openai_tool_stream_init(&st->tool, raw, raw_len, st->emit_pos)) {
+            if (openai_tool_stream_init(&st->tool, r, raw, raw_len, st->emit_pos)) {
                 st->mode = OPENAI_STREAM_TOOL;
             } else {
                 st->mode = OPENAI_STREAM_SUPPRESS;
@@ -16442,6 +16698,450 @@ static void test_openai_tool_stream_handles_multiple_calls(void) {
     close(sv[1]);
 }
 
+#define TEST_TOOL_ACC_MAX 8
+typedef struct {
+    buf args;
+    char name[160];
+    char id[160];
+    int chunks;
+} test_tool_call_acc;
+
+/* Decode one JSON string into out; p must point at the opening quote.
+ * Returns the position after the closing quote.  \uXXXX stays verbatim: the
+ * arguments string itself is JSON text, so inner escapes must not be folded. */
+static const char *test_json_string_decode(buf *out, const char *p, char *dst,
+                                           size_t dstlen) {
+    TEST_ASSERT(*p == '"');
+    p++;
+    buf tmp = {0};
+    for (;;) {
+        unsigned char c = (unsigned char)*p;
+        TEST_ASSERT(c != 0);
+        if (c == '"') { p++; break; }
+        if (c == '\\') {
+            p++;
+            c = (unsigned char)*p;
+            switch (c) {
+            case '"': case '\\': case '/': buf_putc(&tmp, (char)c); break;
+            case 'n': buf_putc(&tmp, '\n'); break;
+            case 'r': buf_putc(&tmp, '\r'); break;
+            case 't': buf_putc(&tmp, '\t'); break;
+            case 'b': buf_putc(&tmp, '\b'); break;
+            case 'f': buf_putc(&tmp, '\f'); break;
+            case 'u':
+                buf_puts(&tmp, "\\u");
+                for (int i = 0; i < 4 && p[1]; i++) {
+                    p++;
+                    buf_putc(&tmp, *p);
+                }
+                break;
+            default: buf_putc(&tmp, (char)c); break;
+            }
+            p++;
+            continue;
+        }
+        buf_putc(&tmp, (char)c);
+        p++;
+    }
+    if (out) buf_append(out, tmp.ptr ? tmp.ptr : "", tmp.len);
+    if (dst && dstlen) {
+        size_t n = tmp.len < dstlen - 1 ? tmp.len : dstlen - 1;
+        memcpy(dst, tmp.ptr ? tmp.ptr : "", n);
+        dst[n] = '\0';
+    }
+    buf_free(&tmp);
+    return p;
+}
+
+/* Walk every SSE "tool_calls" delta in sse and accumulate each call's decoded
+ * "arguments" fragments plus its id/name header fields. */
+static void test_collect_openai_tool_deltas(const char *sse,
+                                            test_tool_call_acc *acc,
+                                            int max_calls,
+                                            int *delta_chunks) {
+    int chunks = 0;
+    const char *p = sse;
+    while ((p = strstr(p, "\"tool_calls\":[{")) != NULL) {
+        const char *line_end = strchr(p, '\n');
+        if (!line_end) line_end = p + strlen(p);
+        const char *idx = strstr(p, "\"index\":");
+        if (!idx || idx >= line_end) { p = line_end; continue; }
+        int index = atoi(idx + strlen("\"index\":"));
+        chunks++;
+        if (index < 0 || index >= max_calls) { p = line_end; continue; }
+        test_tool_call_acc *a = &acc[index];
+        a->chunks++;
+        const char *idf = strstr(p, "\"id\":\"");
+        const char *namef = strstr(p, "\"name\":\"");
+        const char *argsf = strstr(p, "\"arguments\":\"");
+        if (idf && idf < line_end) {
+            test_json_string_decode(NULL, idf + strlen("\"id\":"),
+                                    a->id, sizeof(a->id));
+        }
+        if (namef && namef < line_end) {
+            test_json_string_decode(NULL, namef + strlen("\"name\":"),
+                                    a->name, sizeof(a->name));
+        }
+        if (argsf && argsf < line_end) {
+            test_json_string_decode(&a->args, argsf + strlen("\"arguments\":"),
+                                    NULL, 0);
+        }
+        p = line_end;
+    }
+    if (delta_chunks) *delta_chunks = chunks;
+}
+
+/* The "arguments" string the wire sends for a parsed call: same normalization
+ * append_tool_calls_json applies. */
+static char *test_wire_args(const char *json) {
+    buf b = {0};
+    append_json_object_or_empty(&b, json ? json : "{}");
+    return buf_take(&b);
+}
+
+static void test_tool_call_acc_clear(test_tool_call_acc *acc, int n) {
+    for (int i = 0; i < n; i++) buf_free(&acc[i].args);
+    memset(acc, 0, sizeof(acc[0]) * (size_t)n);
+}
+
+/* Feed `raw` to the live OpenAI stream in `slice`-byte pieces, exactly like
+ * the decode loop does: every call sees the full buffer accumulated so far. */
+static bool test_stream_feed_slices(int fd, request *r, const char *id,
+                                    openai_stream *st,
+                                    const char *raw, size_t len,
+                                    size_t slice) {
+    for (size_t pos = 0; pos < len; pos += slice) {
+        size_t n = len - pos < slice ? len - pos : slice;
+        if (!openai_sse_stream_update(fd, NULL, r, id, st,
+                                      raw, pos + n, false)) return false;
+    }
+    return true;
+}
+
+static void test_qwen4exp_tool_stream_sends_incremental_deltas(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN4EXP;
+
+    TEST_ASSERT(sse_chunk(sv[0], &r, "chatcmpl_q4e_tool", NULL, NULL));
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw =
+        "Let me check.\n\n"
+        "<tool_call>\n"
+        "<function=get_weather>\n"
+        "<parameter=location>\nParis, FR\n</parameter>\n"
+        "<parameter=unit>\ncelsius\n</parameter>\n"
+        "</function>\n"
+        "</tool_call>";
+    /* Awkward 7-byte slices cross every tag and value boundary. */
+    TEST_ASSERT(test_stream_feed_slices(sv[0], &r, "chatcmpl_q4e_tool", &st,
+                                        raw, strlen(raw), 7));
+
+    char *parsed_content = NULL;
+    char *parsed_reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN4EXP, raw, false,
+        &parsed_content, &parsed_reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_q4e_tool", &st,
+                                       raw, strlen(raw), &calls,
+                                       "tool_calls", 10, 4));
+
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    test_tool_call_acc acc[TEST_TOOL_ACC_MAX];
+    memset(acc, 0, sizeof(acc));
+    int delta_chunks = 0;
+    test_collect_openai_tool_deltas(out, acc, TEST_TOOL_ACC_MAX, &delta_chunks);
+
+    char *wire = test_wire_args(calls.v[0].arguments);
+    TEST_ASSERT(delta_chunks >= 3);
+    TEST_ASSERT(acc[0].chunks >= 2);
+    TEST_ASSERT(!strcmp(acc[0].name, "get_weather"));
+    TEST_ASSERT(!strncmp(acc[0].id, "call_", 5));
+    TEST_ASSERT(acc[0].args.ptr != NULL);
+    TEST_ASSERT(acc[0].args.len == strlen(wire));
+    TEST_ASSERT(!memcmp(acc[0].args.ptr, wire, acc[0].args.len));
+    TEST_ASSERT(strstr(acc[0].args.ptr, "\\\"location\\\":\\\"Paris, FR\\\"") != NULL);
+
+    const char *content = strstr(out, "\"content\":\"Let me check.\"");
+    const char *header = strstr(out, "\"name\":\"get_weather\"");
+    const char *finish = strstr(out, "\"finish_reason\":\"tool_calls\"");
+    TEST_ASSERT(content != NULL && header != NULL && finish != NULL);
+    TEST_ASSERT(content < header);
+    TEST_ASSERT(header < finish);
+    TEST_ASSERT(strstr(out, "<tool_call>") == NULL);
+    TEST_ASSERT(strstr(out, "<function=") == NULL);
+    TEST_ASSERT(strstr(out, "<parameter=") == NULL);
+    TEST_ASSERT(strstr(out, "</parameter>") == NULL);
+    /* Only the streamed header carries an id: no second whole-call chunk. */
+    int tool_id_count = 0;
+    for (const char *p = out; (p = strstr(p, "\"id\":\"call_")) != NULL; p++) {
+        tool_id_count++;
+    }
+    TEST_ASSERT(tool_id_count == 1);
+
+    free(wire);
+    test_tool_call_acc_clear(acc, TEST_TOOL_ACC_MAX);
+    free(out);
+    free(parsed_content);
+    free(parsed_reasoning);
+    tool_calls_free(&calls);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_qwen4exp_tool_stream_handles_multiple_calls(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN4EXP;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw =
+        "<tool_call>\n<function=read>\n"
+        "<parameter=path>\na.c\n</parameter>\n"
+        "</function>\n</tool_call>\n"
+        "<tool_call>\n<function=bash>\n"
+        "<parameter=command>\nwc -l a.c\n</parameter>\n"
+        "</function>\n</tool_call>";
+    TEST_ASSERT(test_stream_feed_slices(sv[0], &r, "chatcmpl_q4e_multi", &st,
+                                        raw, strlen(raw), 5));
+
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN4EXP, raw, false, NULL, NULL, &calls));
+    TEST_ASSERT(calls.len == 2);
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_q4e_multi", &st,
+                                       raw, strlen(raw), &calls,
+                                       "tool_calls", 10, 4));
+
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    test_tool_call_acc acc[TEST_TOOL_ACC_MAX];
+    memset(acc, 0, sizeof(acc));
+    test_collect_openai_tool_deltas(out, acc, TEST_TOOL_ACC_MAX, NULL);
+
+    char *wire0 = test_wire_args(calls.v[0].arguments);
+    char *wire1 = test_wire_args(calls.v[1].arguments);
+    TEST_ASSERT(!strcmp(acc[0].name, "read"));
+    TEST_ASSERT(!strcmp(acc[1].name, "bash"));
+    TEST_ASSERT(strncmp(acc[0].id, "call_", 5) == 0);
+    TEST_ASSERT(strncmp(acc[1].id, "call_", 5) == 0);
+    TEST_ASSERT(acc[0].args.len == strlen(wire0));
+    TEST_ASSERT(!memcmp(acc[0].args.ptr, wire0, acc[0].args.len));
+    TEST_ASSERT(acc[1].args.len == strlen(wire1));
+    TEST_ASSERT(!memcmp(acc[1].args.ptr, wire1, acc[1].args.len));
+    /* Order on the wire: index 0's header before index 1's. */
+    TEST_ASSERT(strstr(out, "\"name\":\"read\"") < strstr(out, "\"name\":\"bash\""));
+    int tool_id_count = 0;
+    for (const char *p = out; (p = strstr(p, "\"id\":\"call_")) != NULL; p++) {
+        tool_id_count++;
+    }
+    TEST_ASSERT(tool_id_count == 2);
+
+    free(wire0);
+    free(wire1);
+    test_tool_call_acc_clear(acc, TEST_TOOL_ACC_MAX);
+    free(out);
+    tool_calls_free(&calls);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_qwen4exp_tool_stream_escapes_argument_values(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN4EXP;
+
+    /* Quotes, newline, UTF-8 and a nested JSON document all sit inside one
+     * parameter value; the batch parser stores them as a JSON string. */
+    const char *raw =
+        "<tool_call>\n<function=query>\n"
+        "<parameter=payload>\n"
+        "say \"hi\"\ncaf\xC3\xA9 {\"a\":[1,2]} tail  spaces  \n"
+        "</parameter>\n"
+        "</function>\n</tool_call>";
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    /* 3-byte slices split the UTF-8 sequence and every tag. */
+    TEST_ASSERT(test_stream_feed_slices(sv[0], &r, "chatcmpl_q4e_esc", &st,
+                                        raw, strlen(raw), 3));
+
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN4EXP, raw, false, NULL, NULL, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_q4e_esc", &st,
+                                       raw, strlen(raw), &calls,
+                                       "tool_calls", 10, 4));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    test_tool_call_acc acc[TEST_TOOL_ACC_MAX];
+    memset(acc, 0, sizeof(acc));
+    test_collect_openai_tool_deltas(out, acc, TEST_TOOL_ACC_MAX, NULL);
+
+    char *wire = test_wire_args(calls.v[0].arguments);
+    TEST_ASSERT(acc[0].args.len == strlen(wire));
+    TEST_ASSERT(!memcmp(acc[0].args.ptr, wire, acc[0].args.len));
+    /* Trailing whitespace inside the value is trimmed by the batch parser,
+     * so the streamed concatenation must drop it too. */
+    TEST_ASSERT(strstr(acc[0].args.ptr, "spaces") != NULL);
+    TEST_ASSERT(strstr(acc[0].args.ptr, "spaces  \"") == NULL);
+    TEST_ASSERT(strstr(out, "<parameter=") == NULL);
+
+    free(wire);
+    test_tool_call_acc_clear(acc, TEST_TOOL_ACC_MAX);
+    free(out);
+    tool_calls_free(&calls);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_qwen4exp_tool_stream_truncated_call(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN4EXP;
+
+    /* max_tokens hit inside the parameter value: no </parameter>, no closes. */
+    const char *raw =
+        "Answer:\n\n"
+        "<tool_call>\n<function=bash>\n"
+        "<parameter=command>\nwc -l /var/log/sys";
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    TEST_ASSERT(test_stream_feed_slices(sv[0], &r, "chatcmpl_q4e_trunc", &st,
+                                        raw, strlen(raw), 4));
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_q4e_trunc", &st,
+                                       raw, strlen(raw), NULL,
+                                       "length", 10, 4));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    test_tool_call_acc acc[TEST_TOOL_ACC_MAX];
+    memset(acc, 0, sizeof(acc));
+    test_collect_openai_tool_deltas(out, acc, TEST_TOOL_ACC_MAX, NULL);
+
+    TEST_ASSERT(!strcmp(acc[0].name, "bash"));
+    /* Partial arguments are a strict prefix of the finished call's wire args:
+     * "{\"command\":\"wc -l /var/log/sys" without the closing quote/brace. */
+    const char *expect = "{\"command\":\"wc -l /var/log/sys";
+    TEST_ASSERT(acc[0].args.len == strlen(expect));
+    TEST_ASSERT(!memcmp(acc[0].args.ptr, expect, acc[0].args.len));
+    TEST_ASSERT(strstr(out, "\"finish_reason\":\"length\"") != NULL);
+    TEST_ASSERT(strstr(out, "<tool_call>") == NULL);
+    TEST_ASSERT(strstr(out, "<parameter=") == NULL);
+
+    test_tool_call_acc_clear(acc, TEST_TOOL_ACC_MAX);
+    free(out);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_qwen4exp_tool_stream_kill_switch(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN4EXP;
+
+    const char *raw =
+        "<tool_call>\n<function=bash>\n"
+        "<parameter=command>\npwd\n</parameter>\n"
+        "</function>\n</tool_call>";
+
+    setenv("DS4_SERVER_NO_TOOL_STREAM", "1", 1);
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    TEST_ASSERT(test_stream_feed_slices(sv[0], &r, "chatcmpl_q4e_kill", &st,
+                                        raw, strlen(raw), 4));
+
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN4EXP, raw, false, NULL, NULL, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_q4e_kill", &st,
+                                       raw, strlen(raw), &calls,
+                                       "tool_calls", 10, 4));
+    unsetenv("DS4_SERVER_NO_TOOL_STREAM");
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    /* Old behaviour: nothing streamed while decoding, one whole-call chunk. */
+    TEST_ASSERT(!st.tool.emitted_any);
+    test_tool_call_acc acc[TEST_TOOL_ACC_MAX];
+    memset(acc, 0, sizeof(acc));
+    int delta_chunks = 0;
+    test_collect_openai_tool_deltas(out, acc, TEST_TOOL_ACC_MAX, &delta_chunks);
+    char *wire = test_wire_args(calls.v[0].arguments);
+    TEST_ASSERT(delta_chunks == 1);
+    TEST_ASSERT(acc[0].chunks == 1);
+    TEST_ASSERT(!strcmp(acc[0].name, "bash"));
+    TEST_ASSERT(acc[0].args.len == strlen(wire));
+    TEST_ASSERT(!memcmp(acc[0].args.ptr, wire, acc[0].args.len));
+
+    free(wire);
+    test_tool_call_acc_clear(acc, TEST_TOOL_ACC_MAX);
+    free(out);
+    tool_calls_free(&calls);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 static void test_streaming_holds_partial_utf8(void) {
     const char partial[] = {'A', ' ', (char)0xf0, (char)0x9f, 0};
     const char complete[] = {'A', ' ', (char)0xf0, (char)0x9f,
@@ -20110,6 +20810,11 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_tool_stream_holds_partial_dsml_entities();
     test_openai_tool_stream_holds_partial_utf8_arguments();
     test_openai_tool_stream_handles_multiple_calls();
+    test_qwen4exp_tool_stream_sends_incremental_deltas();
+    test_qwen4exp_tool_stream_handles_multiple_calls();
+    test_qwen4exp_tool_stream_escapes_argument_values();
+    test_qwen4exp_tool_stream_truncated_call();
+    test_qwen4exp_tool_stream_kill_switch();
     test_streaming_holds_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();
     test_parse_glm_tool_call_message();
