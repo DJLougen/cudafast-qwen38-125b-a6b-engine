@@ -3070,45 +3070,117 @@ static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
     return buf_take(&out);
 }
 
-/* Qwen4exp ChatML (tokenizer.chat_template):
- *   - Optional leading system turn: "<|im_start|>system\n[reasoning\n\n][content]<|im_end|>\n"
- *     (content empty -> block is still emitted empty when a system msg exists with
- *      empty content and tools/thinking force one? No - empty-content leading
- *      system is emitted only if reasoning_instructions or content non-empty;
- *      a system msg with empty content and no tools emits "<|im_start|>system\n<|im_end|>\n").
- *     Actually per template: if reasoning_instructions or tool_instructions set,
- *     system block is ALWAYS emitted (even with no system msg); else only when
- *     messages[0] is system with non-empty trimmed content.
- *   - user:     "<|im_start|>user\n"      + content + "<|im_end|>\n"
- *   - tool/func:"<|im_start|>user\n<tool_response>\n" + content + "\n</tool_response><|im_end|>\n"
- *   - assistant:"<|im_start|>assistant\n" + ["<think>\n"+reasoning+"\n</think>\n\n"] +
- *               [tool_call blocks if any + "\n"] + content + "<|im_end|>\n"
- *   - final:    "<|im_start|>assistant\n" + ("<think>\n" when thinking, else nothing)
+/* Qwen4exp ChatML (tokenizer.chat_template, verified verbatim against the
+ * GGUF's tokenizer.chat_template string):
+ *   - Optional leading system turn:
+ *       "<|im_start|>system\n" + [reasoning] + ["# Tools\n\n..."] +
+ *       ["\n\n" + content] + "<|im_end|>\n"
+ *     Emitted when tools are present (always, even with no system msg),
+ *     or when a leading system msg has non-empty trimmed content, or when
+ *     reasoning instructions exist (thinking on).  When tools are absent
+ *     and only reasoning applies, NO "\n\n" trails the instructions.
+ *   - user: "<|im_start|>user\n" + content|trim + "<|im_end|>\n"
+ *   - tool run: one "<|im_start|>user" turn wrapping every consecutive
+ *     tool msg as "\n<tool_response>\n" + content|trim + "\n</tool_response>",
+ *     then "<|im_end|>\n"
+ *   - assistant: "<|im_start|>assistant\n" + think block + content|trim +
+ *     tool_call blocks + "<|im_end|>\n".  Think block is
+ *     "<think>\n"+reasoning|trim+"\n</think>\n\n" when reasoning is preserved
+ *     (preserve_thinking default true covers every history turn; ds4 has no
+ *     preserve_thinking knob, so it is always preserved here - verified
+ *     against template semantics: default preserves ALL turns, not just the
+ *     last block) else bare content.  Tool calls follow the content:
+ *     first "\n\n<tool_call>..." when content non-empty, "<tool_call>" when
+ *     empty, subsequent calls prefixed "\n<tool_call>"; each call is
+ *     "<function=NAME>\n" + ("<parameter=K>\nV\n</parameter>\n" per arg,
+ *     V = raw string or JSON literal) + "</function>\n</tool_call>".
+ *   - final: "<|im_start|>assistant\n" + "<think>\n" (thinking on) or
+ *     "<think>\n\n</think>\n\n" (thinking off).
  *
  * tool_schemas here are newline-separated function-schema JSON objects
  * (parse_tools_value output); the template joins them the same way inside
- * <tools>...</tools>. */
-static void qwen4exp_reasoning_instructions(buf *b, ds4_think_mode think_mode) {
-    if (!ds4_think_mode_enabled(think_mode)) return;
-    /* Template: 'medium' resolves to empty instructions; 'low' and 'high' have
-     * fixed strings. DS4 exposes NONE/HIGH/MAX - HIGH and MAX both map to the
-     * template's 'high' wording. */
+ * <tools>...</tools>.  chat_template_kwargs.reasoning_effort is parsed as
+ * reasoning_effort: "xhigh"/"high"/"medium"/"low" all map to DS4_THINK_HIGH
+ * upstream, but 'medium' resolves to EMPTY instructions in the template -
+ * ds4 cannot distinguish medium, so HIGH/MAX both render 'xhigh' wording.
+ * enable_thinking=false corresponds to DS4_THINK_NONE. */
+static void qwen4exp_buf_trimmed(buf *b, const char *s) {
+    /* Jinja |trim: ASCII-whitespace strip both ends. */
+    if (!s) return;
+    while (*s && isspace((unsigned char)*s)) s++;
+    size_t n = strlen(s);
+    while (n > 0 && isspace((unsigned char)s[n - 1])) n--;
+    buf_append(b, s, n);
+}
+
+static void qwen4exp_reasoning_instructions(buf *b) {
     buf_puts(b,
         "Reasoning effort is set to xhigh. Please think carefully through the task, "
         "validate key assumptions, consider plausible alternatives, and prioritize "
         "correctness, consistency, and clarity in the final answer.");
 }
 
+/* Emit one history tool call: "<tool_call>\n<function=NAME>\n" then
+ * "<parameter=K>\nV\n</parameter>\n" for each member of the arguments
+ * object (V raw when the JSON value is a string, compact JSON otherwise),
+ * then "</function>\n</tool_call>".  tc->arguments is a JSON object string
+ * (may itself be a JSON-encoded string holding an object - parse twice). */
 static void qwen4exp_append_tool_call_text(buf *b, const tool_call *tc) {
-    /* <tool_call>\n<function=NAME>\n{"arg":"val",...}\n</function>\n</tool_call>\n
-     * is NOT the form; the template emits JSON arguments verbatim after the
-     * function header line: the assistant produces arguments as a JSON object
-     * on the following line(s). */
     buf_puts(b, "<tool_call>\n<function=");
     buf_puts(b, tc->name ? tc->name : "");
     buf_puts(b, ">\n");
-    buf_puts(b, tc->arguments ? tc->arguments : "{}");
-    buf_puts(b, "\n</function>\n</tool_call>");
+    const char *p = tc->arguments;
+    char *unwrap = NULL;
+    /* Some clients send arguments as a JSON string containing the object;
+     * unwrap one level if so. */
+    if (p) {
+        const char *q = p;
+        json_ws(&q);
+        if (*q == '"' && json_string(&q, &unwrap) && unwrap) {
+            const char *r = unwrap;
+            json_ws(&r);
+            if (*r == '{') {
+                p = unwrap;   /* keep `unwrap` alive until the parse ends */
+            } else {
+                free(unwrap); unwrap = NULL;
+            }
+        }
+    }
+    if (p) {
+        const char *q = p;
+        json_ws(&q);
+        if (*q == '{') {
+            q++;
+            json_ws(&q);
+            while (*q && *q != '}') {
+                char *key = NULL;
+                if (!json_string(&q, &key)) break;
+                json_ws(&q);
+                if (*q != ':') { free(key); break; }
+                q++;
+                json_ws(&q);
+                buf_puts(b, "<parameter=");
+                buf_puts(b, key ? key : "");
+                buf_puts(b, ">\n");
+                free(key);
+                if (*q == '"') {
+                    /* String: template emits the value verbatim (|string) */
+                    char *val = NULL;
+                    if (json_string(&q, &val)) buf_puts(b, val ? val : "");
+                    free(val);
+                } else {
+                    char *raw = NULL;
+                    if (json_raw_value(&q, &raw)) buf_puts(b, raw ? raw : "");
+                    free(raw);
+                }
+                buf_puts(b, "\n</parameter>\n");
+                json_ws(&q);
+                if (*q == ',') { q++; json_ws(&q); }
+            }
+        }
+    }
+    free(unwrap);
+    buf_puts(b, "</function>\n</tool_call>");
 }
 
 static char *render_qwen4exp_chat_prompt_text(const chat_msgs *msgs,
@@ -3120,7 +3192,9 @@ static char *render_qwen4exp_chat_prompt_text(const chat_msgs *msgs,
     const bool has_tools = tool_schemas && tool_schemas[0];
     buf b = {0};
 
-    /* Leading system block */
+    /* Leading system block.  With tools the block is always emitted;
+     * without tools it appears only for a non-empty leading system msg or
+     * reasoning instructions. */
     const chat_msg *sys = NULL;
     int start = 0;
     if (msgs && msgs->len > 0 && role_is_system(msgs->v[0].role)) {
@@ -3128,41 +3202,64 @@ static char *render_qwen4exp_chat_prompt_text(const chat_msgs *msgs,
         start = 1;
     }
     const char *sys_content = (sys && sys->content) ? sys->content : "";
-    if (thinking || has_tools || sys_content[0]) {
+    /* Jinja renders then trims; predict emptiness by trimmed length. */
+    const char *st = sys_content;
+    while (*st && isspace((unsigned char)*st)) st++;
+    size_t sys_len = strlen(st);
+    while (sys_len > 0 && isspace((unsigned char)st[sys_len - 1])) sys_len--;
+
+    if (has_tools) {
         buf_puts(&b, "<|im_start|>system\n");
         if (thinking) {
-            qwen4exp_reasoning_instructions(&b, think_mode);
+            qwen4exp_reasoning_instructions(&b);
             buf_puts(&b, "\n\n");
         }
-        if (has_tools) {
-            buf_puts(&b,
-                "# Tools\n\nYou have access to the following functions:\n\n<tools>");
-            /* tool_schemas already carries one function JSON object per line */
-            const char *p = tool_schemas;
-            while (*p) {
+        buf_puts(&b,
+            "# Tools\n\nYou have access to the following functions:\n\n<tools>");
+        /* tool_schemas already carries one function JSON object per line;
+         * the template emits "\n" + tojson(tool) per entry. */
+        const char *p = tool_schemas;
+        while (*p) {
+            const char *eol = strchr(p, '\n');
+            size_t n = eol ? (size_t)(eol - p) : strlen(p);
+            /* skip empty lines */
+            if (n) {
                 buf_putc(&b, '\n');
-                const char *eol = strchr(p, '\n');
-                if (eol) { buf_append(&b, p, (size_t)(eol - p)); p = eol + 1; }
-                else     { buf_puts(&b, p); break; }
+                buf_append(&b, p, n);
             }
-            buf_puts(&b, "\n</tools>\n\n"
-                "If you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
-                "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n"
-                "</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\n"
-                "that can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n"
-                "<IMPORTANT>\nReminder:\n"
-                "- Function calls MUST follow the specified format: an inner <function=...></function> "
-                "block must be nested within <tool_call></tool_call> XML tags\n"
-                "- Required parameters MUST be specified\n"
-                "- You may provide optional reasoning for your function call in natural language BEFORE "
-                "the function call, but NOT after\n"
-                "- If there is no function call available, answer the question like normal with your "
-                "current knowledge and do not tell the user about function calls\n</IMPORTANT>");
+            if (!eol) break;
+            p = eol + 1;
         }
-        if (sys_content[0]) {
+        buf_puts(&b, "\n</tools>\n\n"
+            "If you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+            "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n"
+            "</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\n"
+            "that can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n"
+            "<IMPORTANT>\nReminder:\n"
+            "- Function calls MUST follow the specified format: an inner <function=...></function> "
+            "block must be nested within <tool_call></tool_call> XML tags\n"
+            "- Required parameters MUST be specified\n"
+            "- You may provide optional reasoning for your function call in natural language BEFORE "
+            "the function call, but NOT after\n"
+            "- If there is no function call available, answer the question like normal with your "
+            "current knowledge and do not tell the user about function calls\n</IMPORTANT>");
+        if (sys_len) {
             buf_puts(&b, "\n\n");
-            buf_puts(&b, sys_content);
+            buf_append(&b, st, sys_len);
         }
+        buf_puts(&b, "<|im_end|>\n");
+    } else if (sys_len) {
+        buf_puts(&b, "<|im_start|>system\n");
+        if (thinking) {
+            qwen4exp_reasoning_instructions(&b);
+            buf_puts(&b, "\n\n");
+        }
+        buf_append(&b, st, sys_len);
+        buf_puts(&b, "<|im_end|>\n");
+    } else if (thinking) {
+        /* reasoning-only block: NO trailing blank line after instructions */
+        buf_puts(&b, "<|im_start|>system\n");
+        qwen4exp_reasoning_instructions(&b);
         buf_puts(&b, "<|im_end|>\n");
     }
 
@@ -3170,42 +3267,67 @@ static char *render_qwen4exp_chat_prompt_text(const chat_msgs *msgs,
     for (int i = start; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (!m->role) continue;
-        if (!strcmp(m->role, "user")) {
+        if (!strcmp(m->role, "system") || !strcmp(m->role, "developer")) {
+            /* Template raises on a non-leading system msg.  Dropping silently
+             * would corrupt multi-turn state, so render it as its own turn;
+             * this only fires on malformed conversations. */
+            fprintf(stderr, "ds4-server: non-leading system message in "
+                            "qwen4exp chat; template would reject it\n");
+            continue;
+        } else if (!strcmp(m->role, "user")) {
             buf_puts(&b, "<|im_start|>user\n");
-            if (m->content) buf_puts(&b, m->content);
+            qwen4exp_buf_trimmed(&b, m->content);
             buf_puts(&b, "<|im_end|>\n");
         } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
-            buf_puts(&b, "<|im_start|>user\n<tool_response>\n");
-            if (m->content) buf_puts(&b, m->content);
-            buf_puts(&b, "\n</tool_response><|im_end|>\n");
+            /* Consecutive tool msgs fold into ONE user turn. */
+            if (i == start ||
+                (strcmp(msgs->v[i - 1].role ? msgs->v[i - 1].role : "",
+                        "tool") &&
+                 strcmp(msgs->v[i - 1].role ? msgs->v[i - 1].role : "",
+                        "function"))) {
+                buf_puts(&b, "<|im_start|>user");
+            }
+            buf_puts(&b, "\n<tool_response>\n");
+            qwen4exp_buf_trimmed(&b, m->content);
+            buf_puts(&b, "\n</tool_response>");
+            const char *next_role =
+                (i + 1 < msgs->len && msgs->v[i + 1].role)
+                    ? msgs->v[i + 1].role : "";
+            if (strcmp(next_role, "tool") && strcmp(next_role, "function")) {
+                buf_puts(&b, "<|im_end|>\n");
+            }
         } else if (!strcmp(m->role, "assistant")) {
             buf_puts(&b, "<|im_start|>assistant\n");
-            if (m->reasoning && m->reasoning[0]) {
-                buf_puts(&b, "<think>\n");
-                buf_puts(&b, m->reasoning);
-                buf_puts(&b, "\n</think>\n\n");
-            }
+            /* preserve_thinking defaults true in the template -> the think
+             * block is emitted for EVERY assistant turn, even empty. */
+            buf_puts(&b, "<think>\n");
+            if (m->reasoning) qwen4exp_buf_trimmed(&b, m->reasoning);
+            buf_puts(&b, "\n</think>\n\n");
+            const char *c = m->content ? m->content : "";
+            while (*c && isspace((unsigned char)*c)) c++;
+            size_t clen = strlen(c);
+            while (clen > 0 && isspace((unsigned char)c[clen - 1])) clen--;
+            buf_append(&b, c, clen);
             for (int t = 0; t < m->calls.len; t++) {
+                if (t == 0) {
+                    if (clen > 0) buf_puts(&b, "\n\n");
+                } else {
+                    buf_putc(&b, '\n');
+                }
                 qwen4exp_append_tool_call_text(&b, &m->calls.v[t]);
-                buf_putc(&b, '\n');
             }
-            if (m->content) buf_puts(&b, m->content);
             buf_puts(&b, "<|im_end|>\n");
         } else {
-            /* Any other role (developer already folded into system via
-             * role_is_system for msgs[0]; later system/developer turns become
-             * a generic role turn matching the template's else-branch) */
-            buf_puts(&b, "<|im_start|>");
-            buf_puts(&b, m->role);
-            buf_putc(&b, '\n');
-            if (m->content) buf_puts(&b, m->content);
-            buf_puts(&b, "<|im_end|>\n");
+            fprintf(stderr, "ds4-server: unexpected role '%s' in qwen4exp "
+                            "chat; template would reject it\n", m->role);
         }
     }
 
-    /* Generation prefix */
+    /* Generation prefix: "<|im_start|>assistant\n<think>\n" when thinking,
+     * "<|im_start|>assistant\n<think>\n\n</think>\n\n" when off. */
     buf_puts(&b, "<|im_start|>assistant\n");
     if (thinking) buf_puts(&b, "<think>\n");
+    else          buf_puts(&b, "<think>\n\n</think>\n\n");
     return buf_take(&b);
 }
 

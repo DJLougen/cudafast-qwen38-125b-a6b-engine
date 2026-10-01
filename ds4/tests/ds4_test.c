@@ -6784,6 +6784,88 @@ static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
 
+/* --render-fixture: read a JSON fixture
+ *   {"messages":[...], "tools":[...], "thinking":true|false,
+ *    "syntax":"qwen4exp"|"glm"|"deepseek"}
+ * through the SERVER request pipeline pieces (parse_messages,
+ * parse_tools_value, render_chat_prompt_text_for_syntax) and print the
+ * rendered text on stdout followed by a "IDS:" line of token ids when
+ * DS4_RENDER_MODEL names a GGUF.  This is the host-side stand-in for
+ * "what /v1/chat/completions feeds the engine" - same parse, same render,
+ * same tokenizer the model would see. */
+static void test_render_fixture_run(void) {
+    const char *path = getenv("DS4_RENDER_FIXTURE");
+    if (!path || !path[0]) {
+        fprintf(stderr, "DS4_RENDER_FIXTURE not set\n");
+        test_failures++;
+        return;
+    }
+    char *json = test_read_file(path);
+    TEST_ASSERT(json != NULL);
+    if (!json) return;
+
+    const char *p = json;
+    chat_msgs msgs = {0};
+    char *tool_schemas = NULL;
+    tool_schema_orders orders = {0};
+    bool thinking = true;
+    char *syntax_name = NULL;
+
+    json_ws(&p);
+    TEST_ASSERT(*p == '{');
+    if (*p != '{') goto done;
+    p++;
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto done;
+        json_ws(&p);
+        if (*p != ':') { free(key); goto done; }
+        p++;
+        if (!strcmp(key, "messages")) {
+            TEST_ASSERT(parse_messages(&p, &msgs));
+        } else if (!strcmp(key, "tools")) {
+            TEST_ASSERT(parse_tools_value(&p, &tool_schemas, &orders));
+        } else if (!strcmp(key, "thinking")) {
+            json_ws(&p);
+            if (*p == 'f') { thinking = false; json_skip_value(&p); }
+            else           { json_skip_value(&p); }
+        } else if (!strcmp(key, "syntax")) {
+            json_string_replace(&p, &syntax_name);
+        } else {
+            json_skip_value(&p);
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+
+    {
+        server_model_syntax syn = SERVER_MODEL_SYNTAX_DEEPSEEK;
+        if (syntax_name && !strcmp(syntax_name, "qwen4exp"))
+            syn = SERVER_MODEL_SYNTAX_QWEN4EXP;
+        else if (syntax_name && !strcmp(syntax_name, "glm"))
+            syn = SERVER_MODEL_SYNTAX_GLM;
+        char *rendered = render_chat_prompt_text_for_syntax(
+            syn, &msgs, tool_schemas, &orders,
+            thinking ? DS4_THINK_HIGH : DS4_THINK_NONE);
+        fputs(rendered ? rendered : "", stdout);
+        const char *model = getenv("DS4_RENDER_MODEL");
+        if (model && model[0]) {
+            fputs("\n---IDS---\n", stdout);
+            ds4_dump_rendered_token_ids(model, rendered, stdout);
+        }
+        free(rendered);
+    }
+
+done:
+    free(syntax_name);
+    free(tool_schemas);
+    tool_schema_orders_free(&orders);
+    chat_msgs_free(&msgs);
+    free(json);
+}
+
 typedef void (*test_fn)(void);
 
 typedef struct {
@@ -6810,6 +6892,7 @@ static const ds4_test_entry test_entries[] = {
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
     {"--dspark-verify-depth", "dspark-verify-depth", "DSpark speculative verify commits autoregressive-identical tokens at draft depth > 2", test_dspark_verify_depth},
 #endif
+    {"--render-fixture", "render-fixture", "render DS4_RENDER_FIXTURE json through the server chat pipeline", test_render_fixture_run},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 
