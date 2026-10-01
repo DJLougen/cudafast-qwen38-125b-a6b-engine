@@ -78626,9 +78626,9 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
     if (ds4_session_qwen4exp_spec(s)) {
         /* The cycle commits the target's own GREEDY argmax, which is what makes
          * the MTP leg bit-identical to the serial leg.  Sampling would have to
-         * draw from the target and re-verify, and that is not this depth-1
-         * cycle -- so refuse rather than accept the parameters and quietly
-         * ignore them, which is what taking this branch unconditionally did. */
+         * draw from the target and re-verify, and that is not this cycle -- so
+         * a sampled step decodes serially below rather than running the cycle
+         * and quietly ignoring the parameters. */
         /* TEMPERATURE is what decides greedy against sampled: every caller in
          * the tree sets top_k / top_p / min_p unconditionally and lets
          * temperature 0 mean greedy, so refusing on those would refuse every
@@ -78637,11 +78637,16 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
          * bit-identical to the serial leg; only a positive temperature asks
          * for something it does not do. */
         if (temperature > 0.0f) {
-            snprintf(err, errlen,
-                     "qwen4exp MTP: the depth-1 cycle commits the target's "
-                     "greedy argmax; sampling at temperature %.3f is not "
-                     "implemented", (double)temperature);
-            return -1;
+            /* A sampled step: the caller already drew first_token from the
+             * target's distribution, so commit it with one serial step --
+             * exactly what the caller does without --mtp-model -- and draft
+             * nothing.  ds4_session_eval invalidates any carried draft.
+             * (Erroring here broke every sampled request, including requests
+             * that omit temperature and get DS4_DEFAULT_TEMPERATURE.) */
+            if (!accepted || accepted_cap <= 0 || max_tokens <= 0) return 0;
+            if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+            accepted[0] = first_token;
+            return 1;
         }
         (void)top_k; (void)top_p; (void)min_p;
         return ds4_session_qwen4exp_spec_cycle(s, first_token, max_tokens,

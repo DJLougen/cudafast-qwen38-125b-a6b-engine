@@ -13125,8 +13125,15 @@ decode_again:
 
         int toks[17];
         int ntok = 0;
+        /* qwen4exp MTP commits the target's greedy argmax only (see
+         * ds4_session_eval_speculative), so a sampled request -- including
+         * one that omits temperature and gets DS4_DEFAULT_TEMPERATURE --
+         * decodes serially, exactly as without --mtp-model.  ignore_eos
+         * requests are greedy regardless of temperature. */
+        const bool spec_greedy_only = ds4_engine_is_qwen4exp(s->engine);
         if (!s->batched_mode &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
+            (!spec_greedy_only || j->req.ignore_eos || temperature <= 0.0f) &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
             if (j->req.ignore_eos) {
