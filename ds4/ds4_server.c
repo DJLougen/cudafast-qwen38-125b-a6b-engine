@@ -3120,6 +3120,77 @@ static void qwen4exp_reasoning_instructions(buf *b) {
         "correctness, consistency, and clarity in the final answer.");
 }
 
+/* Re-emit one JSON value the way Jinja's tojson (json.dumps,
+ * ensure_ascii=False, default separators ", "/": ") renders it: object
+ * member order preserved, strings re-encoded with json_escape (which
+ * matches ensure_ascii=False - non-ASCII passes through), numbers and
+ * literals verbatim.  tool_schemas arrive as raw client JSON which may be
+ * pretty-printed with newlines, so copying bytes per line corrupts the
+ * <tools> block; canonicalizing makes the render byte-identical to the
+ * template's "tool | tojson". */
+static bool qwen4exp_tojson_value(buf *b, const char **p) {
+    json_ws(p);
+    char c = **p;
+    if (c == '{') {
+        (*p)++;
+        buf_putc(b, '{');
+        bool first = true;
+        json_ws(p);
+        while (**p && **p != '}') {
+            char *key = NULL;
+            if (!json_string(p, &key)) return false;
+            json_ws(p);
+            if (**p != ':') { free(key); return false; }
+            (*p)++;
+            if (!first) buf_puts(b, ", ");
+            first = false;
+            json_escape(b, key);
+            buf_puts(b, ": ");
+            free(key);
+            if (!qwen4exp_tojson_value(b, p)) return false;
+            json_ws(p);
+            if (**p == ',') (*p)++;
+            json_ws(p);
+        }
+        if (**p != '}') return false;
+        (*p)++;
+        buf_putc(b, '}');
+        return true;
+    }
+    if (c == '[') {
+        (*p)++;
+        buf_putc(b, '[');
+        bool first = true;
+        json_ws(p);
+        while (**p && **p != ']') {
+            if (!first) buf_puts(b, ", ");
+            first = false;
+            if (!qwen4exp_tojson_value(b, p)) return false;
+            json_ws(p);
+            if (**p == ',') (*p)++;
+            json_ws(p);
+        }
+        if (**p != ']') return false;
+        (*p)++;
+        buf_putc(b, ']');
+        return true;
+    }
+    if (c == '"') {
+        char *s = NULL;
+        if (!json_string(p, &s)) return false;
+        json_escape(b, s ? s : "");
+        free(s);
+        return true;
+    }
+    /* number / true / false / null: raw lexeme, matches json.dumps spelling
+     * for the values ds4 accepts. */
+    char *raw = NULL;
+    if (!json_raw_value(p, &raw)) return false;
+    buf_puts(b, raw ? raw : "");
+    free(raw);
+    return true;
+}
+
 /* Emit one history tool call: "<tool_call>\n<function=NAME>\n" then
  * "<parameter=K>\nV\n</parameter>\n" for each member of the arguments
  * object (V raw when the JSON value is a string, compact JSON otherwise),
@@ -3216,19 +3287,21 @@ static char *render_qwen4exp_chat_prompt_text(const chat_msgs *msgs,
         }
         buf_puts(&b,
             "# Tools\n\nYou have access to the following functions:\n\n<tools>");
-        /* tool_schemas already carries one function JSON object per line;
-         * the template emits "\n" + tojson(tool) per entry. */
+        /* tool_schemas is a whitespace-separated sequence of JSON values
+         * (one function schema per entry; entries may be pretty-printed
+         * with embedded newlines).  The template emits "\n" + tojson(tool)
+         * per entry, so canonicalize each value - a raw line copy would
+         * break pretty-printed objects apart. */
         const char *p = tool_schemas;
+        json_ws(&p);
         while (*p) {
-            const char *eol = strchr(p, '\n');
-            size_t n = eol ? (size_t)(eol - p) : strlen(p);
-            /* skip empty lines */
-            if (n) {
-                buf_putc(&b, '\n');
-                buf_append(&b, p, n);
+            buf_putc(&b, '\n');
+            if (!qwen4exp_tojson_value(&b, &p)) {
+                /* Unparseable schema: emit raw to keep some signal. */
+                buf_puts(&b, p);
+                break;
             }
-            if (!eol) break;
-            p = eol + 1;
+            json_ws(&p);
         }
         buf_puts(&b, "\n</tools>\n\n"
             "If you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
