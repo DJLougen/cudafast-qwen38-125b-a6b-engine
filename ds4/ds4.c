@@ -30,6 +30,7 @@
 #include <limits.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <signal.h>
 #include <strings.h>
 #include <sys/file.h>
 #include <sys/mman.h>
@@ -39299,7 +39300,12 @@ struct ds4_engine {
      * mmproj on every encode, and exec replaces argv each time. */
     char vision_mmproj[1024];
     char vision_text[1024];
+    /* Persistent encoder child: keeps the mmproj (and its CUDA buffers)
+     * resident across requests.  Spawned lazily on first image. */
     char vision_helper[1024];
+    pid_t vision_child_pid;
+    int   vision_child_in;    /* ds4 -> helper stdin  */
+    int   vision_child_out;   /* helper stdout -> ds4 */
     int vision_image_token;
     int vision_start_token;
     int vision_end_token;
@@ -63683,6 +63689,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->model.fd = -1;
     e->mtp_model.fd = -1;
     e->vision_model.fd = -1;
+    e->vision_child_pid = -1;
+    e->vision_child_in = -1;
+    e->vision_child_out = -1;
     e->backend = opt->backend;
     e->quality = opt->quality;
     e->glm_mtp = opt->glm_mtp;
@@ -65410,15 +65419,144 @@ int ds4_chat_append_multimodal_message(
     return 1;
 }
 
-/* Run the qwen4exp vision helper on one image.  The helper is a
- * subprocess because it links llama.cpp's mtmd/clip (C++), which ds4
- * cannot; exec keeps ds4's own address space and CUDA context out of the
- * encoder entirely.  `path` is used directly when given; otherwise
- * `encoded`/`encoded_len` are staged on a temp file, so the decode the
- * helper does is bit-identical to llama.cpp's.  The helper answers on
- * stdout with
- *   u32 'Q8V1', u32 n_tokens, u32 nx, u32 ny, u32 embd, f32 rows.
- * Its stderr passes through, so diagnostics reach the server log. */
+/* qwen4exp vision helper protocol:
+ *   daemon stdin : u32 path_len | path bytes   (u32 0 = shutdown)
+ *   stdout       : u32 'RDY3' once at start, then per request either
+ *                    u32 'Q8V1' | u32 n_tok | u32 nx | u32 ny | u32 embd
+ *                      | f32 rows
+ *                  or u32 'Q8ER' | u32 msg_len | msg bytes
+ * The daemon keeps the mmproj resident (CUDA ~0.9 GiB); spawn is lazy and
+ * once per engine.  If spawn/exec fails we fall back to one-shot mode. */
+static int ds4_qwen4exp_vision_spawn(ds4_engine *e) {
+    if (e->vision_child_pid > 0) return 1;
+    int pin[2], pout[2];
+    if (pipe(pin) != 0 || pipe(pout) != 0) return 0;
+    const pid_t pid = fork();
+    if (pid == 0) {
+        dup2(pin[0], STDIN_FILENO);
+        dup2(pout[1], STDOUT_FILENO);
+        close(pin[0]); close(pin[1]); close(pout[0]); close(pout[1]);
+        execl(e->vision_helper, e->vision_helper, e->vision_mmproj,
+              "--daemon", (char *)NULL);
+        _exit(127);
+    }
+    close(pin[0]);
+    close(pout[1]);
+    e->vision_child_pid = pid;
+    e->vision_child_in = pin[1];
+    e->vision_child_out = pout[0];
+    uint32_t rdy = 0;
+    const ssize_t n = read(pout[0], &rdy, sizeof(rdy));
+    if (n != (ssize_t)sizeof(rdy) || rdy != 0x52334459u) {
+        close(pin[1]); close(pout[0]);
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
+        e->vision_child_pid = -1;
+        e->vision_child_in = e->vision_child_out = -1;
+        return 0;
+    }
+    return 1;
+}
+static void ds4_qwen4exp_vision_kill(ds4_engine *e) {
+    if (e->vision_child_pid <= 0) return;
+    if (e->vision_child_in >= 0) {
+        uint32_t zero = 0;
+        (void)write(e->vision_child_in, &zero, 4);
+        close(e->vision_child_in);
+    }
+    if (e->vision_child_out >= 0) close(e->vision_child_out);
+    kill(e->vision_child_pid, SIGKILL);
+    waitpid(e->vision_child_pid, NULL, 0);
+    e->vision_child_pid = -1;
+    e->vision_child_in = e->vision_child_out = -1;
+}
+static int ds4_qwen4exp_vision_encode_daemon(
+        ds4_engine *e, const char *path, ds4_vision_embedding *out,
+        char *error, size_t error_cap) {
+    if (e->vision_child_pid <= 0 && !ds4_qwen4exp_vision_spawn(e)) {
+        if (error && error_cap)
+            snprintf(error, error_cap,
+                     "qwen4exp vision helper did not start");
+        return 0;
+    }
+    const uint32_t len = (uint32_t)strlen(path);
+    if (write(e->vision_child_in, &len, 4) != 4 ||
+        write(e->vision_child_in, path, len) != (ssize_t)len) {
+        ds4_qwen4exp_vision_kill(e);
+        if (error && error_cap)
+            snprintf(error, error_cap, "vision helper request write failed");
+        return 0;
+    }
+    uint32_t hdr[5];
+    uint8_t *hp = (uint8_t *)hdr;
+    size_t got = 0;
+    while (got < sizeof(hdr)) {
+        const ssize_t n = read(e->vision_child_out, hp + got,
+                               sizeof(hdr) - got);
+        if (n <= 0) break;
+        got += (size_t)n;
+    }
+    if (got != sizeof(hdr)) {
+        ds4_qwen4exp_vision_kill(e);
+        if (error && error_cap)
+            snprintf(error, error_cap, "vision helper closed its pipe");
+        return 0;
+    }
+    if (hdr[0] == 0x51384552u) {
+        uint32_t mlen = hdr[1] < 256 ? hdr[1] : 256;
+        char msg[300] = {0};
+        size_t m = 0;
+        while (m < mlen) {
+            const ssize_t n = read(e->vision_child_out, msg + m, mlen - m);
+            if (n <= 0) break;
+            m += (size_t)n;
+        }
+        if (error && error_cap)
+            snprintf(error, error_cap, "vision helper: %s", msg);
+        return 0;
+    }
+    if (hdr[0] != 0x51385631u || hdr[1] == 0 || hdr[4] != DS4_N_EMBD) {
+        ds4_qwen4exp_vision_kill(e);
+        if (error && error_cap)
+            snprintf(error, error_cap, "vision helper returned a bad header");
+        return 0;
+    }
+    const uint32_t n_tok = hdr[1];
+    float *rows = malloc((size_t)n_tok * DS4_N_EMBD * sizeof(float));
+    if (!rows) {
+        if (error && error_cap)
+            snprintf(error, error_cap, "unable to allocate vision output");
+        return 0;
+    }
+    uint8_t *rp = (uint8_t *)rows;
+    size_t need = (size_t)n_tok * DS4_N_EMBD * sizeof(float);
+    got = 0;
+    while (got < need) {
+        const ssize_t n = read(e->vision_child_out, rp + got, need - got);
+        if (n <= 0) break;
+        got += (size_t)n;
+    }
+    if (got != need) {
+        free(rows);
+        ds4_qwen4exp_vision_kill(e);
+        if (error && error_cap)
+            snprintf(error, error_cap, "vision helper truncated the rows");
+        return 0;
+    }
+    memset(out, 0, sizeof(*out));
+    out->data = rows;
+    out->token_count = n_tok;
+    out->grid_width = hdr[2];
+    out->grid_height = hdr[3];
+    {
+        uint64_t h = 0xcbf29ce484222325ull;
+        const uint8_t *p = (const uint8_t *)rows;
+        for (size_t i = 0; i < need; i++) { h ^= p[i]; h *= 0x100000001b3ull; }
+        memset(out->fingerprint, 0, sizeof(out->fingerprint));
+        memcpy(out->fingerprint, &h, sizeof(h));
+    }
+    return 1;
+}
 static int ds4_qwen4exp_vision_encode_helper(
         ds4_engine            *e,
         const char            *path,
@@ -65452,86 +65590,10 @@ static int ds4_qwen4exp_vision_encode_helper(
         }
         arg_path = tmp;
     }
-    int pfd[2];
-    if (pipe(pfd) != 0) {
-        if (!path) unlink(tmp);
-        if (error && error_cap)
-            snprintf(error, error_cap, "unable to open the helper pipe");
-        return 0;
-    }
-    const pid_t pid = fork();
-    if (pid == 0) {
-        close(pfd[0]);
-        dup2(pfd[1], STDOUT_FILENO);
-        close(pfd[1]);
-        execl(e->vision_helper, e->vision_helper, e->vision_mmproj,
-              arg_path, (char *)NULL);
-        _exit(127);
-    }
-    close(pfd[1]);
-    uint8_t *buf = NULL;
-    size_t len = 0, cap = 0;
-    for (;;) {
-        if (len == cap) {
-            cap = cap ? cap * 2u : 1u << 20;
-            uint8_t *nb = realloc(buf, cap);
-            if (!nb) { free(buf); buf = NULL; break; }
-            buf = nb;
-        }
-        ssize_t n = read(pfd[0], buf + len, cap - len);
-        if (n <= 0) break;
-        len += (size_t)n;
-    }
-    close(pfd[0]);
-    int status = 0;
-    waitpid(pid, &status, 0);
+    const int rc = ds4_qwen4exp_vision_encode_daemon(e, arg_path, out,
+                                                     error, error_cap);
     if (!path) unlink(tmp);
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 || !buf ||
-        len < 20u) {
-        free(buf);
-        if (error && error_cap)
-            snprintf(error, error_cap,
-                     "qwen4exp vision helper failed (helper %s)",
-                     e->vision_helper);
-        return 0;
-    }
-    uint32_t rd[5];
-    memcpy(rd, buf, sizeof(rd));
-    if (rd[0] != 0x51385631u || rd[1] == 0 || rd[4] != DS4_N_EMBD ||
-        len != 20u + (size_t)rd[1] * rd[4] * sizeof(float)) {
-        free(buf);
-        if (error && error_cap)
-            snprintf(error, error_cap,
-                     "qwen4exp vision helper returned a malformed block");
-        return 0;
-    }
-    float *rows = malloc((size_t)rd[1] * rd[4] * sizeof(float));
-    if (!rows) {
-        free(buf);
-        if (error && error_cap)
-            snprintf(error, error_cap, "unable to allocate vision output");
-        return 0;
-    }
-    memcpy(rows, buf + 20, (size_t)rd[1] * rd[4] * sizeof(float));
-    free(buf);
-    memset(out, 0, sizeof(*out));
-    out->data = rows;
-    out->token_count = rd[1];
-    out->grid_width = rd[2];    /* nx: merged grid width  */
-    out->grid_height = rd[3];   /* ny: merged grid height */
-    /* width/height are 0: unused on this path.  The fingerprint is an
-     * FNV-1a over the raw rows -- enough for the span-identity match and
-     * strictly more stable than hashing encoded bytes. */
-    {
-        uint64_t h = 0xcbf29ce484222325ull;
-        const uint8_t *p = (const uint8_t *)rows;
-        for (size_t i = 0; i < (size_t)rd[1] * rd[4] * sizeof(float); i++) {
-            h ^= p[i]; h *= 0x100000001b3ull;
-        }
-        memset(out->fingerprint, 0, sizeof(out->fingerprint));
-        memcpy(out->fingerprint, &h, sizeof(h));
-    }
-    return 1;
+    return rc;
 #else
     (void)e; (void)path; (void)encoded; (void)encoded_len; (void)out;
     if (error && error_cap)
@@ -65850,6 +65912,7 @@ void ds4_engine_close(ds4_engine *e) {
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
     if (e->mtp_model.map) model_close(&e->mtp_model);
+    ds4_qwen4exp_vision_kill(e);
     if (e->vision_model.map) model_close(&e->vision_model);
     model_close(&e->model);
 #ifndef DS4_NO_GPU
