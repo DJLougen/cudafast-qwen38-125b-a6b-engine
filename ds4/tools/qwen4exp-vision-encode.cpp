@@ -101,8 +101,16 @@ static int encode_one(const std::vector<unsigned char> & bytes,
         fprintf(stderr, "%s: stdout write failed\n", tag);
         return 1;
     }
-    fprintf(stderr, "%s: %d tokens (%dx%d grid, embd %d)\n",
-            tag, n_tokens, nx, ny, embd_dim);
+    {
+        uint64_t h = 0xcbf29ce484222325ull;
+        const unsigned char *p = (const unsigned char *)embd.data();
+        for (size_t i = 0; i < embd.size() * sizeof(float); i++) {
+            h ^= p[i]; h *= 0x100000001b3ull;
+        }
+        fprintf(stderr, "%s: %d tokens (%dx%d grid, embd %d) fnv=%016llx\n",
+                tag, n_tokens, nx, ny, embd_dim,
+                (unsigned long long)h);
+    }
     return 0;
 }
 
