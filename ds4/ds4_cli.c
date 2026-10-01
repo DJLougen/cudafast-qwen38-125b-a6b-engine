@@ -683,9 +683,16 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             if (generated >= max_tokens || cli_interrupt_requested()) {
                 continue;
             }
-
             cli_dist_busy_set(cfg, true);
-            int eval_rc = ds4_session_eval(session, token, err, sizeof(err));
+            /* Greedy serial: eval returns the next winner directly (the
+             * compact top-1 head keeps qwen4exp from materializing the
+             * vocabulary row); anything else keeps eval-then-sample. */
+            int eval_rc = greedy_argmax
+                ? ((greedy_next =
+                    ds4_session_eval_argmax(session, token, err,
+                                            sizeof(err))) < 0)
+                : ds4_session_eval(session, token, err, sizeof(err));
+            have_greedy_next = greedy_argmax && eval_rc == 0;
             cli_dist_busy_set(cfg, false);
             if (eval_rc != 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
@@ -1690,7 +1697,12 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
             generated++;
 
             cli_dist_busy_set(cfg, true);
-            int eval_rc = ds4_session_eval(chat->session, token, err, sizeof(err));
+            int eval_rc = greedy_argmax
+                ? ((greedy_next =
+                    ds4_session_eval_argmax(chat->session, token, err,
+                                            sizeof(err))) < 0)
+                : ds4_session_eval(chat->session, token, err, sizeof(err));
+            have_greedy_next = greedy_argmax && eval_rc == 0;
             cli_dist_busy_set(cfg, false);
             if (eval_rc != 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);

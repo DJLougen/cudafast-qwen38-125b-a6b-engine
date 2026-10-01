@@ -11626,7 +11626,7 @@ static bool complete_tool_call_inside_thinking(const char *text, size_t len,
 }
 
 static int server_eval_token(server *s, server_slot *slot, int token,
-                             char *err, size_t errlen);
+                             int argmax, char *err, size_t errlen);
 
 static char *rendered_chat_system_region(const char *prompt_text) {
     if (!prompt_text) return xstrdup("");
@@ -12426,7 +12426,7 @@ static bool server_cancel_pending_decode_locked(server *s, server_slot *slot) {
 }
 
 static int server_eval_token(server *s, server_slot *slot, int token,
-                             char *err, size_t errlen) {
+                             int argmax, char *err, size_t errlen) {
     if (!s || !slot) return 1;
     if (!s->batched_mode) {
         if (g_stop_requested || slot_job_cancelled(slot)) {
@@ -12436,7 +12436,12 @@ static int server_eval_token(server *s, server_slot *slot, int token,
             return DS4_SESSION_SYNC_INTERRUPTED;
         }
         pthread_mutex_lock(&s->inference_mu);
-        int rc = ds4_session_eval(slot->session, token, err, errlen);
+        /* A greedy request needs only the winner; the argmax eval returns it
+         * through the session's frontier slot (qwen4exp runs the compact
+         * top-1 head) and the sampler consumes it on the next iteration. */
+        int rc = argmax
+            ? (ds4_session_eval_argmax(slot->session, token, err, errlen) < 0)
+            : ds4_session_eval(slot->session, token, err, errlen);
         pthread_mutex_unlock(&s->inference_mu);
         return rc;
     }
@@ -13147,7 +13152,8 @@ decode_again:
                 break;
             }
         } else {
-            if (server_eval_token(s, slot, token, err, sizeof(err)) != 0) {
+            if (server_eval_token(s, slot, token,
+                                  temperature <= 0.0f, err, sizeof(err)) != 0) {
                 finish = "error";
                 break;
             }

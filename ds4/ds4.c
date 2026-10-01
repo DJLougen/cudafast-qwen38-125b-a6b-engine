@@ -54983,6 +54983,12 @@ struct ds4_session {
     ds4_qwen4exp_head_block_ctx qwen4exp_head_ctx;
     bool                       qwen4exp_spec_ready;
     bool                       qwen4exp_spec_failed;
+    /* One-row greedy decode through the screened LM head: the forward leaves
+     * no logits row at all, so s->logits is vacant until a full forward or
+     * qwen4exp_graph_head_logits refills it.  qwen4exp_top1_hc keeps the
+     * pre-final-mixer row needed for that refill. */
+    float                     *qwen4exp_top1_hc;
+    bool                       qwen4exp_logits_vacant;
 #ifdef DS4_TEST_HOOKS
     /* TEST ONLY.  The synthetic head is random weights, so it drafts the right
      * token about once in n_vocab tries and the ACCEPTING half of the cycle is
@@ -58880,6 +58886,13 @@ static bool ds4_session_greedy_splitkv_replay_exact(
 }
 #endif
 
+#ifndef DS4_NO_GPU
+/* One-row greedy decode through the compact top-1 head; defined next to
+ * ds4_session_qwen4exp_rows(). */
+static int ds4_session_qwen4exp_eval_top1(ds4_session *s, int token,
+                                          char *err, size_t errlen);
+#endif
+
 int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen) {
     if (!s) return -1;
     /* qwen4exp joins the eval-then-argmax route unconditionally.  It is not
@@ -58889,6 +58902,14 @@ int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen)
     const bool qwen4exp_session = false;
 #else
     const bool qwen4exp_session = s->qwen4exp;
+    if (qwen4exp_session &&
+        getenv("DS4_QWEN4EXP_NO_TOP1_DECODE") == NULL) {
+        /* The caller needs the winner only, so the forward runs the screened
+         * compact top-1 head rather than materializing the vocabulary row.
+         * Falls back to eval+host argmax on refusal (mm sessions and any
+         * failure keep the old path's logits contract). */
+        return ds4_session_qwen4exp_eval_top1(s, token, err, errlen);
+    }
 #endif
     if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) || qwen4exp_session) {
         if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
@@ -66125,6 +66146,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
          * ds4_session_top_logits read it, unchanged, the way every family
          * does. */
         qs->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(qs->logits[0]));
+        qs->qwen4exp_top1_hc = xmalloc(
+                (size_t)DS4_N_HC * DS4_N_EMBD * sizeof(float));
         qs->qwen4exp = true;
         *out = qs;
         return 0;
@@ -66488,6 +66511,7 @@ void ds4_session_free(ds4_session *s) {
 #ifndef DS4_NO_GPU
     free(s->glm_mtp_hc);
     free(s->glm_mtp_logits0);
+    free(s->qwen4exp_top1_hc);
 #endif
     free(s->mtp_logits);
 #ifndef DS4_NO_GPU
@@ -68159,6 +68183,7 @@ static int ds4_session_qwen4exp_rows(ds4_session *s, const int *tokens,
             snprintf(err, errlen, "qwen4exp: the forward refused");
             return 1;
         }
+        s->qwen4exp_logits_vacant = false;
         /* graph.inc commits mm->n_rows after a successful forward. */
         for (uint32_t i = 0; i < n; i++)
             token_vec_push(&s->checkpoint, tokens[i]);
@@ -68179,6 +68204,7 @@ static int ds4_session_qwen4exp_rows(ds4_session *s, const int *tokens,
         snprintf(err, errlen, "qwen4exp: the forward refused");
         return 1;
     }
+    s->qwen4exp_logits_vacant = false;
     if (ds4_session_qwen4exp_cache_rows(s, tokens, n, pos0, err, errlen) != 0)
         return 1;
     /* The checkpoint IS the session's position: ds4_session_pos() returns
@@ -68191,6 +68217,52 @@ static int ds4_session_qwen4exp_rows(ds4_session *s, const int *tokens,
     s->checkpoint_valid = true;
     return 0;
 }
+/* One decode step for a caller that needs ONLY the argmax token: run the
+ * forward with the compact top-1 tail (the screened head in graph.inc when it
+ * applies) instead of materializing the whole vocabulary row.  The frontier
+ * id lands on s->qwen4exp_spec.frontier_top1, the same slot a committed MTP
+ * round fills, and s->logits stays VACANT -- a caller that later needs the
+ * distribution refills it through
+ * ds4_session_materialize_qwen4exp_frontier().  Returns the token id, or -1
+ * on failure (with `err` filled when the forward refused). */
+static int ds4_session_qwen4exp_eval_top1(ds4_session *s, int token,
+                                          char *err, size_t errlen) {
+    ds4_engine *e = s->engine;
+    /* The same stale-draft discard ds4_session_eval() performs on this path. */
+    ds4_qwen4exp_mtp_invalidate(&s->qwen4exp_spec);
+    if (e->qwen4exp_mtp_ready &&
+        !ds4_session_qwen4exp_spec_init(s, err, errlen)) return -1;
+    const uint32_t pos0 = ds4_qwen4exp_session_pos(e->qwen4exp_session);
+    if (ds4_session_qwen4exp_cache_feed_tail(s, token, pos0, err, errlen) != 0)
+        return -1;
+    int row_top1 = -1;
+    const int32_t tok = (int32_t)token;
+    if (!ds4_qwen4exp_graph_verify_top1_rows(e->qwen4exp_session,
+                                             e->qwen4exp_weights, &e->model,
+                                             &tok, 1u, NULL, &row_top1)) {
+        snprintf(err, errlen, "qwen4exp: the top-1 forward refused");
+        return -1;
+    }
+    if (ds4_session_qwen4exp_cache_rows(s, &token, 1u, pos0, err, errlen) != 0)
+        return -1;
+    token_vec_push(&s->checkpoint, token);
+    s->checkpoint_valid = true;
+    s->qwen4exp_spec.frontier_top1 = row_top1;
+    s->qwen4exp_spec.frontier_top1_valid = row_top1 >= 0;
+    s->qwen4exp_logits_vacant = true;
+    /* Keep the pre-final-mixer row so a later logits consumer can rebuild the
+     * distribution with the head over the same input (see materialize). */
+    if (s->qwen4exp_top1_hc &&
+        ds4_qwen4exp_session_read_hyper(e->qwen4exp_session, 0, 1,
+                                        s->qwen4exp_top1_hc)) {
+        /* Row read failed: mark vacant without a stash; materialize then
+         * falls back to a plain forward of the frontier token if it can, or
+         * reports the gap. */
+        s->qwen4exp_top1_hc[0] = 0.0f;
+    }
+    return row_top1;
+}
+
 
 /* Prefill.  The session is reset first, so a sync is always a whole prompt from
  * position 0 -- the shim never asks for an incremental one, and a partial
@@ -69301,6 +69373,19 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
  * materialize lazily for the less common APIs that inspect other logits. */
 static bool ds4_session_materialize_qwen4exp_frontier(ds4_session *s) {
 #ifndef DS4_NO_GPU
+    if (s && s->qwen4exp && s->qwen4exp_logits_vacant) {
+        /* The last forward was a compact top-1 decode: it produced the winner
+         * id only and left no logits row.  Rebuild the frontier distribution
+         * by rerunning the final mixer and head on the stashed pre-mixer row,
+         * which is exactly what that forward's head consumed. */
+        if (!s->qwen4exp_top1_hc || !s->qwen4exp_seam.head_logits ||
+            s->qwen4exp_seam.head_logits(s->qwen4exp_seam.ctx,
+                                         s->qwen4exp_top1_hc,
+                                         s->logits) != 0) {
+            return false;
+        }
+        s->qwen4exp_logits_vacant = false;
+    }
     if (s && s->qwen4exp &&
         s->qwen4exp_spec.frontier_logits_deferred) {
         if (!s->qwen4exp_seam.read_logit_row ||
@@ -76865,6 +76950,9 @@ static int ds4_session_qwen4exp_spec_cycle(ds4_session *s, int first_token,
                                          first_token, pos, max_tokens,
                                          accepted, accepted_cap, s->logits,
                                          err, errlen);
+    /* A committed round leaves s->logits real again (deferred or not): the
+     * compact verify wrote the device row this read may return. */
+    if (n > 0) s->qwen4exp_logits_vacant = false;
     /* Retain the selected TARGET row: successful cycle returns leave session
      * hyper identical to hc_scratch for all verified rows. Rollback only
      * selects recurrent/PLE state; drafting borrows/restores session hyper

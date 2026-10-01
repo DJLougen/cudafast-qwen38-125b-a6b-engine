@@ -26,6 +26,16 @@ extern int ds4_gpu_mtp_native_scatter2(
         ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *,
         const ds4_gpu_tensor *, ds4_gpu_tensor *, uint32_t, uint32_t,
         uint32_t, int) __attribute__((weak));
+/* The one-row draft-head screen is reused below for the one-row TARGET decode
+ * head (see the LM-head block in ds4_qwen4exp_graph_forward). */
+extern int ds4_gpu_mtp_native_screen(
+        ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, const void *,
+        uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t,
+        const ds4_gpu_tensor *, int) __attribute__((weak));
+extern int ds4_gpu_mtp_native_map(
+        ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *,
+        const ds4_gpu_tensor *, uint32_t, uint32_t, uint32_t,
+        int) __attribute__((weak));
 #endif
 
 /* ======================================================================
@@ -3546,11 +3556,64 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
     const ds4_gpu_tensor *head_x =
         logit_rows == 1u ? s->embed_rows : s->mixed;
     bool target_screened = false;
+    bool screened_top1 = false;
     s->target_native_deferred = false;
     const bool defer_target_invalid =
-        logit_rows == 2u && s->spec_top1_rows == logit_rows &&
+        (logit_rows == 1u || logit_rows == 2u) &&
+        s->spec_top1_rows == logit_rows &&
         getenv("DS4_MTP_NO_DEFER_INVALID_FLAG") == NULL;
-    if (logit_rows == 2u && s->target_native_capacity &&
+    if (logit_rows == 1u && s->spec_top1_rows == 1u &&
+        s->target_native_capacity &&
+        s->target_native_scratch2 && s->target_native_ids &&
+        s->target_native_logits && ds4_gpu_mtp_native_screen &&
+        ds4_gpu_mtp_native_map && cfg->n_vocab > 276u &&
+        getenv("DS4_QWEN4EXP_NO_TOP1_SCREEN") == NULL) {
+        /* One-row decode head: the caller asked for the top-1 only, so the
+         * full-vocabulary row never has to exist.  The DRAFT head's own
+         * screen runs here instead -- 24 coarse groups shortlist the whole
+         * vocabulary to 16384 ids, each shortlisted row then recomputed by
+         * the ordinary exact Q8 dot, and a packed top-1 over the shortlist
+         * mapped back to the original id.  The token-level identity gate
+         * (DS4_MTP_TOKEN_LOG) is what makes this arm claimable: the
+         * shortlist's argmax must equal the full row's.
+         * The R2 path's own comment names this exclusion deliberate; a
+         * declined screen or an invalid input falls through to the plain
+         * matvec exactly as a declined R2 does. */
+        const uint32_t tail = 276u;
+        const uint32_t prefix = cfg->n_vocab - tail;
+        const int rc = ds4_gpu_mtp_native_screen(
+                s->target_native_logits, s->target_native_ids,
+                s->target_native_scratch2, QW_MAP(m, w->output),
+                QW_MAPSZ(m, w->output), QW_OFF(w->output), DS4_N_EMBD,
+                cfg->n_vocab, prefix, tail, head_x,
+                defer_target_invalid);
+        if (rc < 0) {
+            fprintf(stderr,
+                    "ds4: qwen4exp target LM-head R1 screen failed\n");
+            return qwen4exp_forward_fail();
+        }
+        if (rc > 0) {
+            if (!ds4_gpu_indexer_topk_tensor(
+                        s->spec_top1, s->target_native_logits,
+                        (uint32_t)rc, 1u, 1u)) {
+                fprintf(stderr,
+                        "ds4: qwen4exp screened decode top-1 failed\n");
+                return qwen4exp_forward_fail();
+            }
+            if (!ds4_gpu_mtp_native_map(
+                        s->spec_top1, s->target_native_logits,
+                        s->target_native_ids, s->target_native_scratch2,
+                        (uint32_t)rc, cfg->n_vocab, cfg->n_vocab,
+                        defer_target_invalid)) {
+                fprintf(stderr,
+                        "ds4: qwen4exp screened decode map failed\n");
+                return qwen4exp_forward_fail();
+            }
+            screened_top1 = true;
+            s->target_native_deferred = defer_target_invalid;
+        }
+    }
+    if (!screened_top1 && logit_rows == 2u && s->target_native_capacity &&
         s->target_native_scratch2 && s->target_native_ids &&
         s->target_native_logits && ds4_gpu_mtp_native_screen2 &&
         ds4_gpu_mtp_native_scatter2 && cfg->n_vocab > 276u) {
@@ -3597,7 +3660,7 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
             s->target_native_deferred = defer_target_invalid;
         }
     }
-    if (!target_screened &&
+    if (!target_screened && !screened_top1 &&
         !ds4_qwen4exp_matmul_q8_0(s->logits, QW_MAP(m, w->output),
                                   QW_MAPSZ(m, w->output), QW_OFF(w->output),
                                   DS4_N_EMBD, cfg->n_vocab, head_x,
@@ -3605,7 +3668,7 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         fprintf(stderr, "ds4: qwen4exp LM head failed\n");
         return qwen4exp_forward_fail();
     }
-    if (s->spec_top1_rows != 0u &&
+    if (s->spec_top1_rows != 0u && !screened_top1 &&
         (s->spec_top1_rows != logit_rows ||
          !ds4_gpu_indexer_topk_tensor(s->spec_top1, s->logits,
                                       cfg->n_vocab, logit_rows, 1u))) {
