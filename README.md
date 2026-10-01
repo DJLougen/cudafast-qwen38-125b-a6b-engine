@@ -1,5 +1,21 @@
 # cudafast — Qwen 3.8 125B A6B CUDA
 
+> **This branch (`lbf/pq2-rot`) is the fast runtime for
+> [Qwen3.8-Flash-Next-Mooney](https://huggingface.co/DJLougen/Qwen3.8-Flash-Next-Mooney)**:
+> it loads the model's `PQ2_0` ternary experts + `lowbitflash.rot.*` metadata
+> and runs on one DGX Spark with MTP speculative decoding (45.8 tok/s short /
+> 47.7 tok/s at 4k measured). **See [MOONEY.md](MOONEY.md) for what changed
+> and how to run it** — or just use
+> [mooney-spark](https://github.com/DJLougen/mooney-spark) for a one-command
+> setup. Build on GB10 with `make -C ds4 cuda-spark CUDA_ARCH=sm_121 -j8`.
+> Engine lineage: `Layr-Labs/cudafast-qwen38-125b-a6b-engine` → vendored
+> `Layr-Labs/ds4` → `antirez/ds4` (MIT). Compute thanks to
+> [Zach Mueller](https://x.com/TheZachMueller) and [Lambda](https://lambda.ai).
+>
+> *The original benchmark-repo README follows.*
+
+# cudafast — Qwen 3.8 125B A6B CUDA
+
 This repository is the engine for the Qwen 3.8 125B A6B CUDA speedup benchmark.
 The track identifier is `qwen3.8-125b-a6b-cuda-v1`.
 
