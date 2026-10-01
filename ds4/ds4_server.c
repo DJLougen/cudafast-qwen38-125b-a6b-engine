@@ -3195,11 +3195,78 @@ static bool qwen4exp_tojson_value(buf *b, const char **p) {
         free(s);
         return true;
     }
-    /* number / true / false / null: raw lexeme, matches json.dumps spelling
-     * for the values ds4 accepts. */
+    /* number / true / false / null.  Integers (no '.'/'e') and literals go
+     * verbatim - json.dumps(int) is the exact digits and true/false/null
+     * are spelled identically.  Float lexemes need Python repr():
+     * shortest round-trip digits, decimal notation for exponent
+     * -4 <= e <= 15 else "de±NN" scientific. */
     char *raw = NULL;
     if (!json_raw_value(p, &raw)) return false;
-    buf_puts(b, raw ? raw : "");
+    const char *s = raw ? raw : "";
+    const char *t = s + ((*s == '-' || *s == '+') ? 1 : 0);
+    if (strncmp(t, "true", 4) == 0 || strncmp(t, "false", 5) == 0 ||
+        strncmp(t, "null", 4) == 0 ||
+        (strchr(t, '.') == NULL && strchr(t, 'e') == NULL &&
+         strchr(t, 'E') == NULL)) {
+        buf_puts(b, raw ? raw : "");
+        free(raw);
+        return true;
+    }
+    double v = strtod(s, NULL);
+    /* shortest mantissa-digit count that round-trips */
+    int ndig = 1;
+    {
+        char probe[64];
+        for (; ndig <= 17; ndig++) {
+            snprintf(probe, sizeof(probe), "%.*g", ndig, v);
+            if (strtod(probe, NULL) == v) break;
+        }
+        if (ndig > 17) ndig = 17;
+    }
+    /* normalized "d.ddde±X" -> digit string + decimal exponent of the
+     * leading digit (value = D1.D2...Dn * 10^exp). */
+    char sci[64];
+    snprintf(sci, sizeof(sci), "%.*e", ndig - 1, v < 0 ? -v : v);
+    char digits[32] = {0};
+    int dlen = 0;
+    int dec_exp = 0;
+    {
+        const char *e = strchr(sci, 'e');
+        dec_exp = e ? atoi(e + 1) : 0;
+        for (const char *q = sci; q < (e ? e : sci + strlen(sci)); q++) {
+            if (*q >= '0' && *q <= '9' && dlen < (int)sizeof(digits) - 1)
+                digits[dlen++] = *q;
+        }
+        digits[dlen] = '\0';
+    }
+    if (v < 0 || (signbit(v) && v == 0)) buf_putc(b, '-');
+    if (dec_exp >= -4 && dec_exp <= 15) {
+        if (dec_exp < 0) {
+            buf_puts(b, "0.");
+            for (int i = 0; i < -dec_exp - 1; i++) buf_putc(b, '0');
+            buf_puts(b, digits);
+        } else if (dec_exp + 1 >= dlen) {
+            buf_append(b, digits, (size_t)dlen);
+            for (int i = 0; i < dec_exp + 1 - dlen; i++) buf_putc(b, '0');
+            buf_puts(b, ".0");
+        } else {
+            buf_append(b, digits, (size_t)(dec_exp + 1));
+            buf_putc(b, '.');
+            buf_puts(b, digits + dec_exp + 1);
+        }
+    } else {
+        /* scientific: d[.rest]e±NN (exponent padded to >= 2 digits) */
+        buf_putc(b, digits[0]);
+        if (dlen > 1) {
+            buf_putc(b, '.');
+            buf_puts(b, digits + 1);
+        }
+        buf_putc(b, 'e');
+        buf_putc(b, dec_exp < 0 ? '-' : '+');
+        char eb[16];
+        snprintf(eb, sizeof(eb), "%02d", dec_exp < 0 ? -dec_exp : dec_exp);
+        buf_puts(b, eb);
+    }
     free(raw);
     return true;
 }
@@ -3253,9 +3320,13 @@ static void qwen4exp_append_tool_call_text(buf *b, const tool_call *tc) {
                     if (json_string(&q, &val)) buf_puts(b, val ? val : "");
                     free(val);
                 } else {
-                    char *raw = NULL;
-                    if (json_raw_value(&q, &raw)) buf_puts(b, raw ? raw : "");
-                    free(raw);
+                    /* Non-string: template does tojson(arg_value) - emit via
+                     * the canonicalizer so floats get repr() spelling. */
+                    if (!qwen4exp_tojson_value(b, &q)) {
+                        char *raw = NULL;
+                        if (json_raw_value(&q, &raw)) buf_puts(b, raw ? raw : "");
+                        free(raw);
+                    }
                 }
                 buf_puts(b, "\n</parameter>\n");
                 json_ws(&q);
