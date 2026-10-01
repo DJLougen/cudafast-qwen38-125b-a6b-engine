@@ -2858,10 +2858,23 @@ static void append_glm_tool_calls_text(buf *b, const tool_calls *calls,
     buf_putc(b, '\n');
 }
 
+static void qwen4exp_append_tool_call_text(buf *b, const tool_call *tc);
+
 static void append_tool_calls_text_for_syntax(buf *b,
                                               server_model_syntax syntax,
                                               const tool_calls *calls,
                                               const tool_schema_orders *tool_orders) {
+    if (syntax == SERVER_MODEL_SYNTAX_QWEN4EXP) {
+        /* ChatML calls: "\n\n<tool_call>" after preceding content, "\n"
+         * between consecutive calls.  This dispatcher is only invoked from
+         * checkpoint suffixes which already emitted content, so the first
+         * separator is "\n\n" whenever the buffer is non-empty. */
+        for (int t = 0; calls && t < calls->len; t++) {
+            buf_puts(b, (t == 0 && b->len > 0) ? "\n\n" : (t == 0 ? "" : "\n"));
+            qwen4exp_append_tool_call_text(b, &calls->v[t]);
+        }
+        return;
+    }
     if (syntax == SERVER_MODEL_SYNTAX_GLM) {
         append_glm_tool_calls_text(b, calls, tool_orders);
     } else {
@@ -3254,6 +3267,72 @@ static void qwen4exp_append_tool_call_text(buf *b, const tool_call *tc) {
     buf_puts(b, "</function>\n</tool_call>");
 }
 
+/* Shared message-turn loop for qwen4exp ChatML: appends user/tool/assistant
+ * turns for msgs[start..len).  Used by the full renderer and by the live
+ * tool tail (incremental continuation after tool results).  The full
+ * renderer's system/tool preamble and generation prefix are NOT emitted
+ * here. */
+static void qwen4exp_append_turns(buf *b, const chat_msgs *msgs, int start) {
+    for (int i = start; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (!m->role) continue;
+        if (!strcmp(m->role, "system") || !strcmp(m->role, "developer")) {
+            /* Template raises on a non-leading system msg.  Dropping silently
+             * would corrupt multi-turn state, so warn; this only fires on
+             * malformed conversations. */
+            fprintf(stderr, "ds4-server: non-leading system message in "
+                            "qwen4exp chat; template would reject it\n");
+            continue;
+        } else if (!strcmp(m->role, "user")) {
+            buf_puts(b, "<|im_start|>user\n");
+            qwen4exp_buf_trimmed(b, m->content);
+            buf_puts(b, "<|im_end|>\n");
+        } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
+            /* Consecutive tool msgs fold into ONE user turn. */
+            if (i == start ||
+                (strcmp(msgs->v[i - 1].role ? msgs->v[i - 1].role : "",
+                        "tool") &&
+                 strcmp(msgs->v[i - 1].role ? msgs->v[i - 1].role : "",
+                        "function"))) {
+                buf_puts(b, "<|im_start|>user");
+            }
+            buf_puts(b, "\n<tool_response>\n");
+            qwen4exp_buf_trimmed(b, m->content);
+            buf_puts(b, "\n</tool_response>");
+            const char *next_role =
+                (i + 1 < msgs->len && msgs->v[i + 1].role)
+                    ? msgs->v[i + 1].role : "";
+            if (strcmp(next_role, "tool") && strcmp(next_role, "function")) {
+                buf_puts(b, "<|im_end|>\n");
+            }
+        } else if (!strcmp(m->role, "assistant")) {
+            buf_puts(b, "<|im_start|>assistant\n");
+            /* preserve_thinking defaults true in the template -> the think
+             * block is emitted for EVERY assistant turn, even empty. */
+            buf_puts(b, "<think>\n");
+            if (m->reasoning) qwen4exp_buf_trimmed(b, m->reasoning);
+            buf_puts(b, "\n</think>\n\n");
+            const char *c = m->content ? m->content : "";
+            while (*c && isspace((unsigned char)*c)) c++;
+            size_t clen = strlen(c);
+            while (clen > 0 && isspace((unsigned char)c[clen - 1])) clen--;
+            buf_append(b, c, clen);
+            for (int t = 0; t < m->calls.len; t++) {
+                if (t == 0) {
+                    if (clen > 0) buf_puts(b, "\n\n");
+                } else {
+                    buf_putc(b, '\n');
+                }
+                qwen4exp_append_tool_call_text(b, &m->calls.v[t]);
+            }
+            buf_puts(b, "<|im_end|>\n");
+        } else {
+            fprintf(stderr, "ds4-server: unexpected role '%s' in qwen4exp "
+                            "chat; template would reject it\n", m->role);
+        }
+    }
+}
+
 static char *render_qwen4exp_chat_prompt_text(const chat_msgs *msgs,
                                               const char *tool_schemas,
                                               const tool_schema_orders *tool_orders,
@@ -3337,64 +3416,8 @@ static char *render_qwen4exp_chat_prompt_text(const chat_msgs *msgs,
     }
 
     /* Message turns */
-    for (int i = start; msgs && i < msgs->len; i++) {
-        const chat_msg *m = &msgs->v[i];
-        if (!m->role) continue;
-        if (!strcmp(m->role, "system") || !strcmp(m->role, "developer")) {
-            /* Template raises on a non-leading system msg.  Dropping silently
-             * would corrupt multi-turn state, so render it as its own turn;
-             * this only fires on malformed conversations. */
-            fprintf(stderr, "ds4-server: non-leading system message in "
-                            "qwen4exp chat; template would reject it\n");
-            continue;
-        } else if (!strcmp(m->role, "user")) {
-            buf_puts(&b, "<|im_start|>user\n");
-            qwen4exp_buf_trimmed(&b, m->content);
-            buf_puts(&b, "<|im_end|>\n");
-        } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
-            /* Consecutive tool msgs fold into ONE user turn. */
-            if (i == start ||
-                (strcmp(msgs->v[i - 1].role ? msgs->v[i - 1].role : "",
-                        "tool") &&
-                 strcmp(msgs->v[i - 1].role ? msgs->v[i - 1].role : "",
-                        "function"))) {
-                buf_puts(&b, "<|im_start|>user");
-            }
-            buf_puts(&b, "\n<tool_response>\n");
-            qwen4exp_buf_trimmed(&b, m->content);
-            buf_puts(&b, "\n</tool_response>");
-            const char *next_role =
-                (i + 1 < msgs->len && msgs->v[i + 1].role)
-                    ? msgs->v[i + 1].role : "";
-            if (strcmp(next_role, "tool") && strcmp(next_role, "function")) {
-                buf_puts(&b, "<|im_end|>\n");
-            }
-        } else if (!strcmp(m->role, "assistant")) {
-            buf_puts(&b, "<|im_start|>assistant\n");
-            /* preserve_thinking defaults true in the template -> the think
-             * block is emitted for EVERY assistant turn, even empty. */
-            buf_puts(&b, "<think>\n");
-            if (m->reasoning) qwen4exp_buf_trimmed(&b, m->reasoning);
-            buf_puts(&b, "\n</think>\n\n");
-            const char *c = m->content ? m->content : "";
-            while (*c && isspace((unsigned char)*c)) c++;
-            size_t clen = strlen(c);
-            while (clen > 0 && isspace((unsigned char)c[clen - 1])) clen--;
-            buf_append(&b, c, clen);
-            for (int t = 0; t < m->calls.len; t++) {
-                if (t == 0) {
-                    if (clen > 0) buf_puts(&b, "\n\n");
-                } else {
-                    buf_putc(&b, '\n');
-                }
-                qwen4exp_append_tool_call_text(&b, &m->calls.v[t]);
-            }
-            buf_puts(&b, "<|im_end|>\n");
-        } else {
-            fprintf(stderr, "ds4-server: unexpected role '%s' in qwen4exp "
-                            "chat; template would reject it\n", m->role);
-        }
-    }
+    qwen4exp_append_turns(&b, msgs, start);
+
 
     /* Generation prefix: "<|im_start|>assistant\n<think>\n" when thinking,
      * "<|im_start|>assistant\n<think>\n\n</think>\n\n" when off. */
@@ -3402,6 +3425,24 @@ static char *render_qwen4exp_chat_prompt_text(const chat_msgs *msgs,
     if (thinking) buf_puts(&b, "<think>\n");
     else          buf_puts(&b, "<think>\n\n</think>\n\n");
     return buf_take(&b);
+}
+
+/* Incremental tail after tool results for qwen4exp: the previous assistant
+ * turn already sampled through its final token; the tail closes that turn
+ * ("<|im_end|>\n"), renders the new messages (tool results fold into user
+ * turns exactly as in the full render), and re-opens the generation prefix.
+ * Byte-for-byte this matches what a full re-render of the conversation
+ * would produce after the sampled prefix. */
+static char *render_qwen4exp_live_tool_tail(const chat_msgs *msgs, int start,
+                                            ds4_think_mode think_mode) {
+    const bool think = ds4_think_mode_enabled(think_mode);
+    buf out = {0};
+    buf_puts(&out, "<|im_end|>\n");
+    qwen4exp_append_turns(&out, msgs, start);
+    buf_puts(&out, "<|im_start|>assistant\n");
+    if (think) buf_puts(&out, "<think>\n");
+    else       buf_puts(&out, "<think>\n\n</think>\n\n");
+    return buf_take(&out);
 }
 
 static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
@@ -3621,6 +3662,9 @@ static char *render_live_tool_tail_for_syntax(server_model_syntax syntax,
                                               const chat_msgs *msgs, int start,
                                               const tool_schema_orders *tool_orders,
                                               ds4_think_mode think_mode) {
+    if (syntax == SERVER_MODEL_SYNTAX_QWEN4EXP) {
+        return render_qwen4exp_live_tool_tail(msgs, start, think_mode);
+    }
     if (syntax == SERVER_MODEL_SYNTAX_GLM) {
         return render_glm_live_tool_tail(msgs, start, tool_orders, think_mode);
     }
@@ -6173,12 +6217,162 @@ static bool parse_glm_generated_message_ex(const char *text,
     return true;
 }
 
+
+/* ChatML (Qwen) generated tool calls:
+ *
+ *   <think>...</think>\n\ncontent<tool_call>\n<function=NAME>\n
+ *   <parameter=K>\nV\n</parameter>\n...</function>\n</tool_call>
+ *
+ * Parameter values are raw text between <parameter=K> and </parameter>
+ * (the leading newline after the key tag and the trailing newline before
+ * </parameter> are template boilerplate, stripped by the inner trim).
+ * Values are reported as JSON strings in arguments (matching the GLM
+ * parser's is_string="true" convention): the format carries no type
+ * information, so "123" stays "123" rather than becoming a number.
+ *
+ * Trailing text after the last </tool_call> is left out of
+ * raw_tool_text (same as GLM) - it becomes part of neither content nor
+ * the call.  Content is everything before the first <tool_call>. */
+static bool parse_qwen4exp_generated_message_ex(const char *text,
+                                                bool require_thinking_closed,
+                                                char **content_out,
+                                                char **reasoning_out,
+                                                tool_calls *calls) {
+    static const char tool_start[] = "<tool_call>";
+    static const char tool_end[] = "</tool_call>";
+    static const char func_start[] = "<function=";
+    static const char func_end[] = "</function>";
+    static const char param_start[] = "<parameter=";
+    static const char param_end[] = "</parameter>";
+
+    text = text ? text : "";
+    const char *tool_search = text;
+    bool recovered_unclosed_tool = false;
+    if (require_thinking_closed) {
+        const char *think_end = find_last_substr(text, "</think>");
+        if (!think_end) {
+            const char *candidate = strstr(text, tool_start);
+            if (!candidate || !strstr(candidate, tool_end)) {
+                fprintf(stderr, "ds4-server: thinking not closed, ignoring incomplete ChatML tool calls in reasoning\n");
+                ds4_local_unterminated_reasoning(text, content_out, reasoning_out);
+                return true;
+            }
+            tool_search = candidate;
+            recovered_unclosed_tool = true;
+        } else {
+            tool_search = think_end + 8;
+        }
+    }
+
+    const char *start = strstr(tool_search, tool_start);
+    if (!start) {
+        split_reasoning_content(text, strlen(text), content_out, reasoning_out);
+        return true;
+    }
+
+    const char *raw_block_start = start;
+    if (start >= text + 2 && start[-2] == '\n' && start[-1] == '\n') {
+        raw_block_start = start - 2;
+    }
+    size_t content_len = trim_tool_separator_ws(text, 0,
+                                                (size_t)(raw_block_start - text));
+    const char *p = start;
+    for (;;) {
+        p = skip_ascii_ws(p);
+        if (strncmp(p, tool_start, strlen(tool_start)) != 0) break;
+        p += strlen(tool_start);
+
+        const char *close = strstr(p, tool_end);
+        if (!close) return false;
+
+        /* <function=NAME> ... </function> inside the call */
+        const char *fs = strstr(p, func_start);
+        if (!fs || fs > close) return false;
+        fs += strlen(func_start);
+        const char *name_end = strchr(fs, '>');
+        if (!name_end || name_end > close) return false;
+        char *name = xstrndup(fs, (size_t)(name_end - fs));
+        const char *fe = strstr(name_end, func_end);
+        if (!fe || fe > close) { free(name); return false; }
+        p = name_end + 1;
+
+        buf args = {0};
+        for (;;) {
+            p = skip_ascii_ws(p);
+            if (!strncmp(p, func_end, strlen(func_end))) break;
+            if (strncmp(p, param_start, strlen(param_start)) != 0) {
+                free(name);
+                buf_free(&args);
+                return false;
+            }
+            p += strlen(param_start);
+            const char *key_end = strchr(p, '>');
+            if (!key_end || key_end > close) {
+                free(name); buf_free(&args); return false;
+            }
+            char *key = xstrndup(p, (size_t)(key_end - p));
+            p = key_end + 1;
+            /* Value runs to the matching </parameter>; the template wraps
+             * it in "\n" on both sides which we trim. */
+            const char *value_end = strstr(p, param_end);
+            if (!value_end || value_end > close) {
+                free(name); free(key); buf_free(&args); return false;
+            }
+            const char *vs = p, *ve = value_end;
+            trim_const_span(&vs, &ve);
+            char *value = xstrndup(vs, (size_t)(ve - vs));
+            tool_call_json_args_add(&args, key, value, "true");
+            free(key);
+            free(value);
+            p = value_end + strlen(param_end);
+        }
+        p = fe + strlen(func_end);
+
+        tool_call tc = {0};
+        tc.name = name;
+        buf wrapped = {0};
+        buf_putc(&wrapped, '{');
+        buf_puts(&wrapped, args.ptr ? args.ptr : "");
+        buf_putc(&wrapped, '}');
+        tc.arguments = buf_take(&wrapped);
+        tool_calls_push(calls, tc);
+        buf_free(&args);
+
+        /* expect </tool_call> */
+        const char *q = skip_ascii_ws(p);
+        if (strncmp(q, tool_end, strlen(tool_end)) != 0) return false;
+        p = q + strlen(tool_end);
+
+        const char *next = skip_ascii_ws(p);
+        if (strncmp(next, tool_start, strlen(tool_start)) != 0) {
+            p = next;
+            break;
+        }
+        p = next;
+    }
+
+    if (calls->len == 0) return false;
+    free(calls->raw_tool_text);
+    calls->raw_tool_text = xstrndup(raw_block_start, (size_t)(p - raw_block_start));
+    if (recovered_unclosed_tool) {
+        ds4_unterminated_reasoning_before_tool(text, content_len,
+                                               content_out, reasoning_out);
+    } else {
+        split_reasoning_content(text, content_len, content_out, reasoning_out);
+    }
+    return true;
+}
 static bool parse_generated_message_ex_for_syntax(server_model_syntax syntax,
                                                   const char *text,
                                                   bool require_thinking_closed,
                                                   char **content_out,
                                                   char **reasoning_out,
                                                   tool_calls *calls) {
+    if (syntax == SERVER_MODEL_SYNTAX_QWEN4EXP) {
+        return parse_qwen4exp_generated_message_ex(text, require_thinking_closed,
+                                                   content_out, reasoning_out,
+                                                   calls);
+    }
     if (syntax == SERVER_MODEL_SYNTAX_GLM) {
         return parse_glm_generated_message_ex(text, require_thinking_closed,
                                               content_out, reasoning_out,
@@ -11816,7 +12010,9 @@ static char *build_tool_checkpoint_suffix(const request *r, const char *content,
     buf_puts(&suffix, content ? content : "");
     append_tool_calls_text_for_syntax(&suffix, syntax, calls,
                                       r ? &r->tool_orders : NULL);
-    if (syntax != SERVER_MODEL_SYNTAX_GLM) {
+    if (syntax == SERVER_MODEL_SYNTAX_QWEN4EXP) {
+        buf_puts(&suffix, "<|im_end|>");
+    } else if (syntax != SERVER_MODEL_SYNTAX_GLM) {
         buf_puts(&suffix, "<｜end▁of▁sentence｜>");
     }
     return buf_take(&suffix);
@@ -11846,7 +12042,9 @@ static char *build_responses_visible_assistant_suffix(const request *r,
     buf_puts(&suffix, content ? content : "");
     append_tool_calls_text_for_syntax(&suffix, syntax, calls,
                                       r ? &r->tool_orders : NULL);
-    if (syntax != SERVER_MODEL_SYNTAX_GLM) {
+    if (syntax == SERVER_MODEL_SYNTAX_QWEN4EXP) {
+        buf_puts(&suffix, "<|im_end|>");
+    } else if (syntax != SERVER_MODEL_SYNTAX_GLM) {
         buf_puts(&suffix, "<｜end▁of▁sentence｜>");
     }
     return buf_take(&suffix);
