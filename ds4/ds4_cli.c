@@ -366,6 +366,7 @@ static bool is_rendered_chat_prompt(const char *prompt) {
         "[gMASK]",
         "<sop>",
         "<|system|>",
+        "<|im_start|>",
         "<|user|>",
         "<|assistant|>",
         "<|observation|>",
