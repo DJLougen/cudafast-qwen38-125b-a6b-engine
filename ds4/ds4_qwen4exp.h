@@ -275,6 +275,13 @@ typedef struct {
     uint32_t indexer_q_dim;  /* indexer_head * indexer_head_dim          */
     uint32_t indexer_k_dim;  /* indexer_kv_head * indexer_head_dim       */
     bool     synthetic_reduced;
+    /* M-RoPE sections (qwen4exp.rope.dimension_sections) and the PLE token
+     * id image rows report to the n-gram history
+     * (qwen4exp.ple.image_token_id).  Both are optional reads with the
+     * reference values as defaults so a text GGUF without them still
+     * opens. */
+    int32_t  rope_sections[4];
+    int32_t  ple_image_token_id;
 } ds4_qwen4exp_config;
 
 /* Set by config_validate_qwen4exp_model(); read by the binder and by L3-L7. */

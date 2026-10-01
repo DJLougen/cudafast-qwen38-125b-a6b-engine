@@ -585,6 +585,29 @@ static void qwen4exp_expect_shared_geometry(const ds4_model *m) {
                       DS4_N_VALUE_DIM);
     config_expect_u32("rope.dimension_count",
                       required_u32(m, "qwen4exp.rope.dimension_count"), DS4_N_ROT);
+    /* M-RoPE section sizes (t,h,w,e).  Optional: the Mooney checkpoint
+     * carries qwen4exp.rope.dimension_sections; absent it, the reference
+     * [11,11,10,0] stands. */
+    {
+        uint64_t sec[4] = {11, 11, 10, 0};
+        uint32_t nsec = 0;
+        static const char *const sec_keys[] = {
+            "qwen4exp.rope.dimension_sections",
+        };
+        uint64_t tmp[4];
+        if (qwen4exp_read_int_array_any(m, sec_keys, 1, tmp, 4, &nsec) &&
+            nsec == 4) {
+            for (int i = 0; i < 4; i++) sec[i] = tmp[i];
+        }
+        for (int i = 0; i < 4; i++)
+            g_ds4_qwen4exp.rope_sections[i] = (int32_t)sec[i];
+    }
+    {
+        uint32_t v = 0;
+        g_ds4_qwen4exp.ple_image_token_id =
+            model_get_u32(m, "qwen4exp.ple.image_token_id", &v)
+                ? (int32_t)v : -1;
+    }
     config_expect_u32("expert_count",
                       required_u32(m, "qwen4exp.expert_count"), DS4_N_EXPERT);
     config_expect_u32("expert_used_count",

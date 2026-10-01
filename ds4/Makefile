@@ -108,7 +108,7 @@ QWEN4EXP_NVCCFLAGS := $(filter-out --use_fast_math,$(NVCCFLAGS)) -ftz=false -pre
 # Vendored llama.cpp mmq prefill tier (cuda/mmq/, see cuda/mmq/VENDOR.md).
 MMQ_INCLUDES := -Icuda/mmq
 MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.o cuda/mmq/ds4_mmq.o cuda/mmq/ds4_mmq_d2r.o cuda/mmq/quantize.o cuda/mmq/mmid.o cuda/mmq/mmvq.o cuda/mmq/ds4_repack.o
-CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_cuda_qwen4exp.o ds4_layer_pack.o ds4_qwen4exp_ple.o ds4_qwen4exp_mtp.o ds4_qwen4exp_mtp_hooks.o $(MMQ_OBJS)
+CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_cuda_qwen4exp.o ds4_cuda_qwen4exp_mm.o ds4_qwen4exp_mm.o ds4_layer_pack.o ds4_qwen4exp_ple.o ds4_qwen4exp_mtp.o ds4_qwen4exp_mtp_hooks.o $(MMQ_OBJS)
 CPU_CORE_OBJS = ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o ds4_qwen4exp_ple.o ds4_qwen4exp_mtp_cpu.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
@@ -122,7 +122,7 @@ ROCM_MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.rocm.o cuda/mmq/ds4_mmq.rocm.o cuda/mmq
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
-GPU_TEST_OBJS := ds4_cuda.o ds4_cuda_qwen4exp.o ds4_image.o $(MMQ_OBJS)
+GPU_TEST_OBJS := ds4_cuda.o ds4_cuda_qwen4exp.o ds4_cuda_qwen4exp_mm.o ds4_qwen4exp_mm.o ds4_image.o $(MMQ_OBJS)
 GPU_TEST_LINK = $(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 GPU_TEST_LINK_SAFE = $(GPU_TEST_LINK)
 GPU_KERNEL_TESTS :=
@@ -349,7 +349,7 @@ test-mxfp4-cuda: tests/test_mxfp4_cuda
 	./tests/test_mxfp4_cuda
 endif
 
-ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_qwen4exp.h ds4_qwen4exp_moe_types.h ds4_qwen4exp_hc_types.h ds4_qwen4exp.inc ds4_qwen4exp_ple.h ds4_qwen4exp_graph.h ds4_qwen4exp_graph.inc ds4_qwen4exp_gdn_replay.h ds4_qwen4exp_matmul.h ds4_qwen4exp_mtp.h ds4_qwen4exp_model_registration.h
+ds4.o: ds4.c ds4.h ds4_qwen4exp_mm.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_qwen4exp.h ds4_qwen4exp_moe_types.h ds4_qwen4exp_hc_types.h ds4_qwen4exp.inc ds4_qwen4exp_ple.h ds4_qwen4exp_graph.h ds4_qwen4exp_graph.inc ds4_qwen4exp_gdn_replay.h ds4_qwen4exp_matmul.h ds4_qwen4exp_mtp.h ds4_qwen4exp_model_registration.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 ds4_image.o: ds4_image.c ds4_image.h third_party/iris/jpeg.h third_party/iris/png.h
@@ -750,6 +750,12 @@ ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_cuda_qwen4exp.cuh ds4_gpu_mgpu.h ds4_glm53
 # Every Qwen4-Exp CUDA kernel, built without fast math (QWEN4EXP_NVCCFLAGS).
 ds4_cuda_qwen4exp.o: ds4_cuda_qwen4exp.cu ds4_cuda_qwen4exp.cuh ds4_gpu.h ds4_qwen4exp_gdn_replay.h ds4_qwen4exp_moe_types.h ds4_qwen4exp_hc_types.h ds4_gpu_mgpu.h ds4_qwen4exp_hc_ref.h ds4_qwen4exp_hc_host.inc ds4_qwen4exp_ple_host.inc ds4_qwen4exp_matmul.h ds4_qwen4exp_mtp.h
 	$(NVCC) $(QWEN4EXP_NVCCFLAGS) -c -o $@ ds4_cuda_qwen4exp.cu
+# The mm (M-RoPE image) variants, same no-fast-math flag set: the rope angles
+# carry raw position magnitudes there too.
+ds4_cuda_qwen4exp_mm.o: ds4_cuda_qwen4exp_mm.cu ds4_cuda_qwen4exp.cuh ds4_gpu.h
+	$(NVCC) $(QWEN4EXP_NVCCFLAGS) -c -o $@ ds4_cuda_qwen4exp_mm.cu
+ds4_qwen4exp_mm.o: ds4_qwen4exp_mm.c ds4_qwen4exp_mm.h ds4_gpu.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_qwen4exp_mm.c
 
 # Vendored mmq pieces (see cuda/mmq/VENDOR.md).  ds4_mmq.cu transitively
 # pulls in mmq.cuh which has heavy template instantiation -- each piece

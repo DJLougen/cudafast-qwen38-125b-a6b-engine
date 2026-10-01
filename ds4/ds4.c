@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <limits.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <strings.h>
 #include <sys/file.h>
 #include <sys/mman.h>
@@ -7059,6 +7060,7 @@ static void config_validate_glm53_model(const ds4_model *m) {
 }
 
 #include "ds4_qwen4exp.h"
+#include "ds4_qwen4exp_mm.h"
 /* Before the .inc: the binder's n-gram hash tripwire calls the derivation
  * this header declares. */
 #include "ds4_qwen4exp_ple.h"
@@ -39268,6 +39270,11 @@ typedef enum {
     DS4_VISION_NONE = 0,
     DS4_VISION_GLM53,
     DS4_VISION_DEEPSEEK4,
+    /* qwen4exp images: the encoder runs OUTSIDE ds4 -- the
+     * qwen4exp-vision-encode helper (mtmd/clip, CPU) -- and ds4 consumes
+     * the embedding rows as input, so vision_ready here means "the helper
+     * is reachable", not "a GPU vision tower is mapped". */
+    DS4_VISION_QWEN4EXP,
 } ds4_vision_kind;
 
 struct ds4_engine {
@@ -39288,6 +39295,11 @@ struct ds4_engine {
     ds4_deepseek4_vision_weights deepseek4_vision_weights;
 #endif
     ds4_vision_kind vision_kind;
+    /* --vision path kept for DS4_VISION_QWEN4EXP: the helper reopens the
+     * mmproj on every encode, and exec replaces argv each time. */
+    char vision_mmproj[1024];
+    char vision_text[1024];
+    char vision_helper[1024];
     int vision_image_token;
     int vision_start_token;
     int vision_end_token;
@@ -55009,6 +55021,11 @@ struct ds4_session {
     ds4_vision_identity *checkpoint_images;
     size_t checkpoint_image_count;
     const ds4_vision_span *sync_images;
+    /* Borrowed span list for the in-flight multimodal prefill (valid only
+     * while ds4_session_sync is running it) plus the MTP-off log latch. */
+    const ds4_vision_span *mm_spans;
+    size_t mm_span_count;
+    int mm_mtp_logged;
     size_t sync_image_count;
     token_vec greedy_splitkv_segment;
     float *logits;
@@ -63790,14 +63807,81 @@ static int ds4_engine_open_internal(ds4_engine **out,
     if (opt->warm_weights) model_warm_weights(&e->model);
     config_validate_model(&e->model);
     if (opt->vision_path && opt->vision_path[0]) {
-        if (!ds4_model_is_glm53() && !g_ds4_flash_vision_exp) {
+        const int is_qwen4exp = ds4_model_is_qwen4exp();
+        if (!ds4_model_is_glm53() && !g_ds4_flash_vision_exp && !is_qwen4exp) {
             fprintf(stderr,
-                    "ds4: --vision requires GLM-5.3 or the pinned "
-                    "DeepSeek V4 Flash Vision-Exp model\n");
+                    "ds4: --vision requires GLM-5.3, the pinned "
+                    "DeepSeek V4 Flash Vision-Exp model, or qwen4exp\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
         }
+        if (is_qwen4exp) {
+            /* The vision tower runs in the qwen4exp-vision-encode helper
+             * (mtmd/clip, CPU).  ds4 only checks the mmproj GGUF names the
+             * expected projector and embedding width, then records the
+             * paths the per-encode exec needs. */
+            model_open(&e->vision_model, opt->vision_path, false, false);
+            ds4_str arch = {0}, proj = {0};
+            if (!model_get_string(&e->vision_model, "general.architecture",
+                                  &arch) ||
+                !ds4_streq(arch, "clip")) {
+                ds4_die("--vision file is not a clip mmproj GGUF");
+            }
+            if (!model_get_string(&e->vision_model, "clip.projector_type",
+                                  &proj) ||
+                !ds4_streq(proj, "qwen3vl_merger")) {
+                ds4_die("qwen4exp --vision mmproj is not qwen3vl_merger");
+            }
+            uint32_t pdim = 0;
+            if (model_get_u32(&e->vision_model,
+                              "clip.vision.projection_dim", &pdim) &&
+                pdim != DS4_N_EMBD) {
+                fprintf(stderr,
+                        "ds4: qwen4exp --vision projection_dim %u != %u\n",
+                        pdim, (unsigned)DS4_N_EMBD);
+                ds4_die("qwen4exp --vision projection_dim mismatch");
+            }
+            snprintf(e->vision_mmproj, sizeof(e->vision_mmproj), "%s",
+                     opt->vision_path);
+            snprintf(e->vision_text, sizeof(e->vision_text), "%s",
+                     opt->model_path);
+            const char *helper = getenv("DS4_QWEN4EXP_VISION_HELPER");
+            if (!helper || !helper[0]) {
+                /* default: alongside the ds4 binary */
+                ssize_t r = readlink("/proc/self/exe", e->vision_helper,
+                                     sizeof(e->vision_helper) - 1);
+                if (r > 0) {
+                    e->vision_helper[r] = 0;
+                    char *slash = strrchr(e->vision_helper, '/');
+                    if (slash) slash[1] = 0;
+                    strncat(e->vision_helper, "tools/qwen4exp-vision-encode",
+                            sizeof(e->vision_helper) -
+                            strlen(e->vision_helper) - 1);
+                } else {
+                    snprintf(e->vision_helper, sizeof(e->vision_helper),
+                             "%s", "ds4/tools/qwen4exp-vision-encode");
+                }
+            } else {
+                snprintf(e->vision_helper, sizeof(e->vision_helper),
+                         "%s", helper);
+            }
+            e->vision_kind = DS4_VISION_QWEN4EXP;
+            e->vision_image_token = 248056;   /* <|image_pad|>  */
+            e->vision_start_token = 248053;   /* <|vision_start|> */
+            e->vision_end_token   = 248054;   /* <|vision_end|>  */
+            if (g_ds4_qwen4exp.ple_image_token_id >= 0 &&
+                g_ds4_qwen4exp.ple_image_token_id != e->vision_image_token) {
+                fprintf(stderr,
+                        "ds4: qwen4exp ple.image_token_id %d disagrees with "
+                        "the image pad token\n",
+                        g_ds4_qwen4exp.ple_image_token_id);
+                ds4_die("qwen4exp ple.image_token_id mismatch");
+            }
+            e->vision_ready = true;
+            /* Keep the mapping: engine_close owns it, and the helper
+             * never reads through this handle. */
+        } else {
 #ifdef DS4_NO_GPU
         fprintf(stderr, "ds4: this build does not include a GPU vision backend\n");
         ds4_engine_close(e);
@@ -63832,6 +63916,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
         e->vision_ready = true;
 #endif
+        }
     }
     if (load_slice && load_layer_end == UINT32_MAX) {
         const uint32_t normal_layers = ds4_model_normal_layer_count();
@@ -65325,6 +65410,136 @@ int ds4_chat_append_multimodal_message(
     return 1;
 }
 
+/* Run the qwen4exp vision helper on one image.  The helper is a
+ * subprocess because it links llama.cpp's mtmd/clip (C++), which ds4
+ * cannot; exec keeps ds4's own address space and CUDA context out of the
+ * encoder entirely.  `path` is used directly when given; otherwise
+ * `encoded`/`encoded_len` are staged on a temp file, so the decode the
+ * helper does is bit-identical to llama.cpp's.  The helper answers on
+ * stdout with
+ *   u32 'Q8V1', u32 n_tokens, u32 nx, u32 ny, u32 embd, f32 rows.
+ * Its stderr passes through, so diagnostics reach the server log. */
+static int ds4_qwen4exp_vision_encode_helper(
+        ds4_engine            *e,
+        const char            *path,
+        const uint8_t         *encoded,
+        size_t                 encoded_len,
+        ds4_vision_embedding  *out,
+        char                  *error,
+        size_t                 error_cap) {
+#ifndef __APPLE__
+    char tmp[] = "/tmp/ds4-vision-XXXXXX";
+    const char *arg_path = path;
+    if (!arg_path) {
+        int fd = mkstemp(tmp);
+        if (fd < 0) {
+            if (error && error_cap)
+                snprintf(error, error_cap, "unable to stage the image file");
+            return 0;
+        }
+        size_t wrote = 0;
+        while (wrote < encoded_len) {
+            ssize_t n = write(fd, encoded + wrote, encoded_len - wrote);
+            if (n <= 0) break;
+            wrote += (size_t)n;
+        }
+        close(fd);
+        if (wrote != encoded_len) {
+            unlink(tmp);
+            if (error && error_cap)
+                snprintf(error, error_cap, "unable to write the image file");
+            return 0;
+        }
+        arg_path = tmp;
+    }
+    int pfd[2];
+    if (pipe(pfd) != 0) {
+        if (!path) unlink(tmp);
+        if (error && error_cap)
+            snprintf(error, error_cap, "unable to open the helper pipe");
+        return 0;
+    }
+    const pid_t pid = fork();
+    if (pid == 0) {
+        close(pfd[0]);
+        dup2(pfd[1], STDOUT_FILENO);
+        close(pfd[1]);
+        execl(e->vision_helper, e->vision_helper, e->vision_mmproj,
+              arg_path, (char *)NULL);
+        _exit(127);
+    }
+    close(pfd[1]);
+    uint8_t *buf = NULL;
+    size_t len = 0, cap = 0;
+    for (;;) {
+        if (len == cap) {
+            cap = cap ? cap * 2u : 1u << 20;
+            uint8_t *nb = realloc(buf, cap);
+            if (!nb) { free(buf); buf = NULL; break; }
+            buf = nb;
+        }
+        ssize_t n = read(pfd[0], buf + len, cap - len);
+        if (n <= 0) break;
+        len += (size_t)n;
+    }
+    close(pfd[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (!path) unlink(tmp);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 || !buf ||
+        len < 20u) {
+        free(buf);
+        if (error && error_cap)
+            snprintf(error, error_cap,
+                     "qwen4exp vision helper failed (helper %s)",
+                     e->vision_helper);
+        return 0;
+    }
+    uint32_t rd[5];
+    memcpy(rd, buf, sizeof(rd));
+    if (rd[0] != 0x51385631u || rd[1] == 0 || rd[4] != DS4_N_EMBD ||
+        len != 20u + (size_t)rd[1] * rd[4] * sizeof(float)) {
+        free(buf);
+        if (error && error_cap)
+            snprintf(error, error_cap,
+                     "qwen4exp vision helper returned a malformed block");
+        return 0;
+    }
+    float *rows = malloc((size_t)rd[1] * rd[4] * sizeof(float));
+    if (!rows) {
+        free(buf);
+        if (error && error_cap)
+            snprintf(error, error_cap, "unable to allocate vision output");
+        return 0;
+    }
+    memcpy(rows, buf + 20, (size_t)rd[1] * rd[4] * sizeof(float));
+    free(buf);
+    memset(out, 0, sizeof(*out));
+    out->data = rows;
+    out->token_count = rd[1];
+    out->grid_width = rd[2];    /* nx: merged grid width  */
+    out->grid_height = rd[3];   /* ny: merged grid height */
+    /* width/height are 0: unused on this path.  The fingerprint is an
+     * FNV-1a over the raw rows -- enough for the span-identity match and
+     * strictly more stable than hashing encoded bytes. */
+    {
+        uint64_t h = 0xcbf29ce484222325ull;
+        const uint8_t *p = (const uint8_t *)rows;
+        for (size_t i = 0; i < (size_t)rd[1] * rd[4] * sizeof(float); i++) {
+            h ^= p[i]; h *= 0x100000001b3ull;
+        }
+        memset(out->fingerprint, 0, sizeof(out->fingerprint));
+        memcpy(out->fingerprint, &h, sizeof(h));
+    }
+    return 1;
+#else
+    (void)e; (void)path; (void)encoded; (void)encoded_len; (void)out;
+    if (error && error_cap)
+        snprintf(error, error_cap,
+                 "qwen4exp vision is only built on Linux (helper exec)");
+    return 0;
+#endif
+}
 static int ds4_engine_vision_encode_image(
         ds4_engine            *e,
         const ds4_image       *image,
@@ -65370,6 +65585,15 @@ static int ds4_engine_vision_encode_image(
     uint32_t grid_width = 0, grid_height = 0;
     uint32_t layout = 0;
     int ok = 0;
+    if (e->vision_kind == DS4_VISION_QWEN4EXP) {
+        /* Unreachable: encode_file/encode_memory short-circuit to the
+         * helper with the ORIGINAL encoded bytes so decode stays
+         * bit-identical to llama.cpp; a raw ds4_image would lose that. */
+        if (error && error_cap)
+            snprintf(error, error_cap,
+                     "qwen4exp vision needs the encoded image bytes");
+        return 0;
+    }
     if (e->vision_kind == DS4_VISION_DEEPSEEK4) {
         ds4_deepseek4_image_patches patches = {0};
         if (!ds4_image_preprocess_deepseek4(
@@ -65442,6 +65666,9 @@ int ds4_engine_vision_encode_file(
         ds4_vision_embedding *out,
         char *error,
         size_t error_cap) {
+    if (e && e->vision_kind == DS4_VISION_QWEN4EXP)
+        return ds4_qwen4exp_vision_encode_helper(
+            e, path, NULL, 0, out, error, error_cap);
     ds4_image image = {0};
     if (!ds4_image_decode_file(&image, path, error, error_cap)) return 0;
     int ok = ds4_engine_vision_encode_image(e, &image, out, error, error_cap);
@@ -65456,6 +65683,9 @@ int ds4_engine_vision_encode_memory(
         ds4_vision_embedding *out,
         char *error,
         size_t error_cap) {
+    if (e && e->vision_kind == DS4_VISION_QWEN4EXP)
+        return ds4_qwen4exp_vision_encode_helper(
+            e, NULL, encoded, encoded_len, out, error, error_cap);
     ds4_image image = {0};
     if (!ds4_image_decode_memory(&image, encoded, encoded_len, error, error_cap)) return 0;
     int ok = ds4_engine_vision_encode_image(e, &image, out, error, error_cap);
@@ -67622,8 +67852,18 @@ int ds4_session_sync_multimodal(
         char *err,
         size_t errlen) {
 #ifndef DS4_NO_GPU
-    if (ds4_session_qwen4exp_unsupported(s, "ds4_session_sync_multimodal", err, errlen)) {
+    if (s && s->qwen4exp &&
+        s->engine->vision_kind != DS4_VISION_QWEN4EXP) {
+        snprintf(err, errlen,
+                 "qwen4exp: multimodal prompts need --vision <mmproj> so the "
+                 "encoder helper is armed");
         return 1;
+    }
+    if (!s || !s->qwen4exp) {
+        if (ds4_session_qwen4exp_unsupported(
+                s, "ds4_session_sync_multimodal", err, errlen)) {
+            return 1;
+        }
     }
 #endif
     if (!s || !prompt || (image_count != 0 && !images)) {
@@ -67781,6 +68021,87 @@ static int ds4_session_qwen4exp_rows(ds4_session *s, const int *tokens,
         return 1;
     }
     for (uint32_t i = 0; i < n; i++) buf[i] = (int32_t)tokens[i];
+    ds4_qwen4exp_session *qs = e->qwen4exp_session;
+    /* Multimodal sessions run EVERY chunk through the mm path once armed:
+     * the cell map is session state and must see every row.  MTP is
+     * disabled for image-conditioned sessions: the head cache publishes by
+     * position, and mrope t is not the slot index, so a drafted round would
+     * write keyed-by-t rows over slot-keyed state. */
+    if (qs->mm) {
+        if (e->qwen4exp_mtp_ready && !s->mm_mtp_logged) {
+            s->mm_mtp_logged = 1;
+            fprintf(stderr,
+                    "ds4: qwen4exp: MTP disabled for image-conditioned "
+                    "sessions (mrope positions are not slot positions)\n");
+        }
+        /* Slice this chunk against the stored spans.  base is the dense
+         * row cursor: prompt rows consumed so far live in the checkpoint
+         * tape, which counts one entry per prompt row. */
+        const uint32_t base = (uint32_t)s->checkpoint.len;
+        int32_t is_image[DS4_QWEN4EXP_SERIAL_MAX_ROWS];
+        ds4_qwen4exp_mm_slice slices[8];
+        uint32_t n_slices = 0;
+        memset(is_image, 0, n * sizeof(is_image[0]));
+        for (size_t si = 0; si < s->mm_span_count; si++) {
+            const ds4_vision_span *sp = &s->mm_spans[si];
+            const uint32_t lo = sp->token_start;
+            const uint32_t hi = lo + sp->embedding.token_count;
+            if (base + n <= lo || base >= hi) continue;
+            if (n_slices >= 8) {
+                snprintf(err, errlen,
+                         "qwen4exp mm: more than 8 image slices per chunk");
+                return 1;
+            }
+            ds4_qwen4exp_mm_slice *sl = &slices[n_slices++];
+            sl->prompt_lo = lo > base ? lo : base;
+            const uint32_t last = hi < base + n ? hi : base + n;
+            sl->n_rows = last - sl->prompt_lo;
+            sl->nx = sp->embedding.grid_width;
+            sl->ny = sp->embedding.grid_height;
+            sl->embd = sp->embedding.data;
+            sl->embd_skip = sl->prompt_lo - lo;
+            for (uint32_t i = sl->prompt_lo - base;
+                 i < sl->prompt_lo - base + sl->n_rows; i++)
+                is_image[i] = 1;
+            if (!sl->nx || !sl->ny || !sl->embd ||
+                (uint64_t)sl->nx * sl->ny != sp->embedding.token_count) {
+                snprintf(err, errlen,
+                         "qwen4exp mm: bad image grid for span at %u", lo);
+                return 1;
+            }
+        }
+        /* Forward-declared order check: slices must be contiguous image
+         * runs, and no image row may appear unflagged. */
+        uint32_t cover = 0;
+        for (uint32_t i = 0; i < n; i++) cover += (uint32_t)is_image[i];
+        uint32_t want = 0;
+        for (uint32_t i = 0; i < n_slices; i++) want += slices[i].n_rows;
+        if (cover != want) {
+            snprintf(err, errlen,
+                     "qwen4exp mm: image-row map does not cover the spans");
+            return 1;
+        }
+        uint32_t adv = 0;
+        if (!ds4_qwen4exp_mm_plan(qs->mm, slices, n_slices, is_image, n,
+                                &qs->mm->t,
+                                qs->mm->pend_pos, qs->mm->pend_embd,
+                                qs->mm->pend_map, &adv, err, errlen)) {
+            return 1;
+        }
+        (void)adv;   /* mm owns the mrope t cursor now */
+        qs->mm_pending = 1;
+        if (!ds4_qwen4exp_graph_verify_rows(qs, e->qwen4exp_weights,
+                                          &e->model, buf, n, NULL,
+                                          s->logits, 1u)) {
+            snprintf(err, errlen, "qwen4exp: the forward refused");
+            return 1;
+        }
+        /* graph.inc commits mm->n_rows after a successful forward. */
+        for (uint32_t i = 0; i < n; i++)
+            token_vec_push(&s->checkpoint, tokens[i]);
+        s->checkpoint_valid = true;
+        return 0;
+    }
     /* A caller may feed serial rows without sync or eager prepare. Initialize
      * before its first target HC row can be overwritten by a later forward;
      * any lazy allocation is charged to that real call. */
@@ -67833,15 +68154,42 @@ static int ds4_session_qwen4exp_sync(ds4_session *s, const ds4_tokens *prompt,
     s->checkpoint.len = 0;
     s->checkpoint_valid = false;
 
+    /* Arm the multimodal path when this prompt carries vision spans.  The
+     * spans are valid for the whole call (the multimodal wrapper borrowed
+     * them from the caller); rows() reads them for chunk slicing. */
+    s->mm_spans = s->sync_images;
+    s->mm_span_count = s->sync_image_count;
+    if (s->mm_span_count && !e->qwen4exp_session->mm) {
+        e->qwen4exp_session->mm = ds4_qwen4exp_mm_create(
+            plan->n_ctx, DS4_N_INDEXER_COMPRESS_RATIO, plan->n_batch,
+            DS4_N_EMBD, g_ds4_qwen4exp.rope_sections);
+        if (!e->qwen4exp_session->mm) {
+            s->mm_spans = NULL;
+            s->mm_span_count = 0;
+            snprintf(err, errlen,
+                     "qwen4exp: unable to allocate multimodal state");
+            return 1;
+        }
+        fprintf(stderr,
+                "ds4: qwen4exp multimodal session armed (%u image span%s)\n",
+                (unsigned)s->mm_span_count,
+                s->mm_span_count == 1 ? "" : "s");
+    }
     const uint32_t batch = plan->n_batch;
     for (int at = 0; at < prompt->len; ) {
         const uint32_t take = (uint32_t)((prompt->len - at) < (int)batch
                                          ? (prompt->len - at) : (int)batch);
         const int rc = ds4_session_qwen4exp_rows(s, prompt->v + at, take,
                                                  err, errlen);
-        if (rc != 0) return rc;
+        if (rc != 0) {
+            s->mm_spans = NULL;
+            s->mm_span_count = 0;
+            return rc;
+        }
         at += (int)take;
     }
+    s->mm_spans = NULL;
+    s->mm_span_count = 0;
     return 0;
 }
 #endif /* !DS4_NO_GPU */
