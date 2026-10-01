@@ -4110,6 +4110,34 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "chat_template_kwargs")) {
+            /* vLLM/llama.cpp convention: {"enable_thinking": bool}.  The
+             * suite drives thinking per-profile through this field only. */
+            json_ws(&p);
+            if (*p != '{') { free(key); goto bad; }
+            p++;
+            json_ws(&p);
+            while (*p && *p != '}') {
+                char *kkey = NULL;
+                if (!json_string(&p, &kkey)) { free(key); goto bad; }
+                json_ws(&p);
+                if (*p != ':') { free(key); free(kkey); goto bad; }
+                p++;
+                json_ws(&p);
+                if (!strcmp(kkey, "enable_thinking")) {
+                    if (!json_bool(&p, &thinking_enabled)) {
+                        free(key); free(kkey); goto bad;
+                    }
+                    got_thinking = true;
+                } else if (!json_skip_value(&p)) {
+                    free(key); free(kkey); goto bad;
+                }
+                free(kkey);
+                json_ws(&p);
+                if (*p == ',') { p++; json_ws(&p); }
+            }
+            if (*p != '}') { free(key); goto bad; }
+            p++;
         } else if (!json_skip_value(&p)) {
             free(key);
             goto bad;
