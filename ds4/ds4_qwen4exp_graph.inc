@@ -298,6 +298,16 @@ static bool qwen4exp_ple_read_constants(const ds4_model            *m,
 struct ds4_qwen4exp_session {
     ds4_qwen4exp_session_plan plan;
     uint32_t pos;
+    /* Multimodal (image) row state: allocated when a prompt first carries
+     * vision spans.  While set, every forward goes through the mm kernels:
+     * cell-map pool updates, per-row rope positions, and (for image rows)
+     * embedding overrides.  pos stays the LOGICAL t; mm->n_rows is the
+     * dense slot cursor. */
+    struct ds4_qwen4exp_mm *mm;
+    /* per-forward pending plan: filled by the caller (ds4.c) between the
+     * plan and this forward, consumed inside ds4_qwen4exp_graph_forward. */
+    int      mm_pending;
+
 
     /* FALSE means every state object below is byte-for-byte what a reset
      * leaves: the caches, the recurrent states, the convolution histories,
@@ -1025,6 +1035,8 @@ void ds4_qwen4exp_session_close(ds4_qwen4exp_session *s) {
     ds4_gpu_tensor_free(s->shexp_mid);
     ds4_gpu_tensor_free(s->shexp_gate);
     ds4_gpu_tensor_free(s->logits);
+    ds4_qwen4exp_mm_free(s->mm);
+    s->mm = NULL;
     ds4_gpu_tensor_free(s->spec_top1);
     ds4_gpu_tensor_free(s->target_native_scratch2);
     ds4_gpu_tensor_free(s->target_native_ids);
@@ -1113,6 +1125,10 @@ void ds4_qwen4exp_session_reset(ds4_qwen4exp_session *s) {
     ds4_ple_history_reset(&s->ple_constants, &s->ple_history);
     s->pos = 0;
     s->state_dirty = false;
+    s->mm_pending = 0;
+    /* The cell map is session state like the KV caches: resetting rewinds
+     * the slot cursor, which makes every cell free again. */
+    if (s->mm) ds4_qwen4exp_mm_reset(s->mm);
 }
 
 /* ======================================================================
@@ -1930,7 +1946,7 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     }
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (n_tokens<=2u) {
+    if (n_tokens<=2u && !s->mm) {
         ds4_gpu_tensor *outs[5]={s->qsa_q,s->qsa_gate,s->qsa_k[il],s->qsa_v[il],NULL};
         const ds4_gpu_tensor *ins[6]={s->qsa_doubled,s->qsa_kin,s->qsa_vin,
                                     s->attn_q_norm[il],s->attn_k_norm[il],s->inv_freq};
@@ -1945,7 +1961,20 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     {
         /* Fused Q-Prep: split doubled-query, per-head RMS norm, and RoPE in 1 launch.
          * The gate copy is skipped when the output gate reads it from doubled. */
-        if (!(qw_qsa_gate_from_doubled(n_tokens, DS4_N_HEAD * head_dim, head_dim)
+        if (s->mm) {
+            const bool gate_from_doubled = qw_qsa_gate_from_doubled(
+                n_tokens, DS4_N_HEAD * head_dim, head_dim);
+            if (!ds4_gpu_qwen4exp_mm_prep_q(
+                    s->qsa_q, gate_from_doubled ? NULL : s->qsa_gate,
+                    s->qsa_doubled, s->attn_q_norm[il], s->inv_freq,
+                    s->mm->d_row_pos, s->mm->d_sections,
+                    n_tokens, DS4_N_HEAD, head_dim, DS4_N_ROT,
+                    DS4_RMS_EPS, l->attn_q_norm_offset)) {
+                fprintf(stderr,
+                        "ds4: qwen4exp mm Q-prep failed at block %u\n", il);
+                return false;
+            }
+        } else if (!(qw_qsa_gate_from_doubled(n_tokens, DS4_N_HEAD * head_dim, head_dim)
               ? ds4_gpu_qwen4exp_qsa_prep_q_nogate_dpos_tensor(
                     s->qsa_q, s->qsa_doubled, s->attn_q_norm[il],
                     s->inv_freq, n_tokens, DS4_N_HEAD, head_dim, DS4_N_ROT, pos0,
@@ -1960,7 +1989,19 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
 
         /* Fused KV-Prep & Append: per-head RMS norm on K, RoPE on K, and direct write into
          * k_cache and v_cache in 1 launch (no sync CPU memcpy) */
-        if (!ds4_gpu_qwen4exp_qsa_prep_kv_append_fused_dpos_tensor(
+        if (s->mm) {
+            if (!ds4_gpu_qwen4exp_mm_prep_kv(
+                    s->qsa_k[il], s->qsa_v[il], s->qsa_kin, s->qsa_vin,
+                    s->attn_k_norm[il], s->inv_freq, s->mm->d_row_pos,
+                    s->mm->d_sections, s->d_pos,
+                    n_tokens, DS4_N_HEAD_KV, head_dim, DS4_N_ROT,
+                    s->plan.n_ctx, DS4_RMS_EPS, l->attn_k_norm_offset)) {
+                fprintf(stderr,
+                        "ds4: qwen4exp mm KV prep & append failed at block %u\n",
+                        il);
+                return false;
+            }
+        } else if (!ds4_gpu_qwen4exp_qsa_prep_kv_append_fused_dpos_tensor(
                 s->qsa_k[il], s->qsa_v[il], NULL, s->qsa_kin, s->qsa_vin,
                 s->attn_k_norm[il], s->inv_freq, pos0, n_tokens, DS4_N_HEAD_KV,
                 head_dim, DS4_N_ROT, s->plan.n_ctx, DS4_RMS_EPS, l->attn_k_norm_offset,
@@ -1980,7 +2021,9 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
      * chain runs only when `indexed`.  Below the budget its result was written
      * and never read, so it moves under the same condition.  This removes a
      * computation whose output no reader observes; it does not change one. */
-    const bool indexed = (uint64_t)pos0 + n_tokens > DS4_N_INDEXER_TOP_K;
+    const bool indexed = s->mm
+        ? (uint64_t)s->mm->n_rows + n_tokens > DS4_N_INDEXER_TOP_K
+        : (uint64_t)pos0 + n_tokens > DS4_N_INDEXER_TOP_K;
 
     if (!ds4_qwen4exp_matmul_bf16(s->idx_k, QW_MAP(m, l->indexer_k_proj),
                                   QW_MAPSZ(m, l->indexer_k_proj),
@@ -1999,7 +2042,18 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
         fprintf(stderr, "ds4: qwen4exp indexer projections failed at block %u\n", il);
         return false;
     }
-    if (!ds4_gpu_qwen4exp_qsa_indexer_pool_update_dpos_tensor(
+    if (s->mm) {
+        if (!ds4_gpu_qwen4exp_mm_pool_update(
+                s->idx_pool[il], s->idx_tape[il], s->idx_k,
+                s->idx_k_norm[il], s->inv_freq, s->d_pos, s->mm->d_dirty,
+                s->mm->d_blk_cells, n_tokens, s->mm->dirty_n,
+                s->plan.n_ctx, DS4_N_INDEXER_HEAD_DIM, ratio, DS4_N_ROT,
+                DS4_RMS_EPS, l->indexer_k_norm_offset)) {
+            fprintf(stderr,
+                    "ds4: qwen4exp mm pool update failed at block %u\n", il);
+            return false;
+        }
+    } else if (!ds4_gpu_qwen4exp_qsa_indexer_pool_update_dpos_tensor(
             s->idx_pool[il], s->idx_tape[il], s->idx_k, s->idx_k_norm[il],
             s->inv_freq, pos0, n_tokens, s->plan.n_ctx,
             DS4_N_INDEXER_HEAD_DIM, ratio, DS4_N_ROT, DS4_RMS_EPS,
@@ -2018,8 +2072,45 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
         if (!ds4_gpu_qwen4exp_head_rms_norm_tensor(
                 s->idx_q, s->idx_q, s->idx_q_norm[il],
                 n_tokens * DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM,
-                DS4_RMS_EPS, l->indexer_q_norm_offset) ||
-            !ds4_gpu_qwen4exp_rope_head_tensor(s->idx_q, s->inv_freq, n_tokens,
+                DS4_RMS_EPS, l->indexer_q_norm_offset)) {
+            fprintf(stderr, "ds4: qwen4exp indexer q norm failed at block %u\n",
+                    il);
+            return false;
+        }
+        if (s->mm) {
+            /* Blocks span the POSITION range; cells span the slot range.
+             * pos_hi is the last row's t. */
+            const uint32_t n_cells = s->mm->n_rows + n_tokens;
+            const uint32_t pos_hi =
+                (uint32_t)s->mm->pend_pos[4u * (n_tokens - 1u)];
+            const uint32_t mm_blocks =
+                pos_hi / ratio + 1u < n_blocks ? pos_hi / ratio + 1u
+                                               : n_blocks;
+            const uint32_t tk_eff =
+                top_k < mm_blocks ? top_k : mm_blocks;
+            if (!ds4_gpu_qwen4exp_mm_rope_idxq(
+                    s->idx_q, s->inv_freq, s->mm->d_row_pos,
+                    s->mm->d_sections, n_tokens, DS4_N_INDEXER_HEAD,
+                    DS4_N_INDEXER_HEAD_DIM, DS4_N_ROT) ||
+                !ds4_gpu_qwen4exp_mm_indexer_scores(
+                    s->idx_scores, s->idx_q, s->idx_pool[il],
+                    s->mm->d_blk_filled, s->mm->d_row_pos,
+                    n_tokens, mm_blocks, DS4_N_INDEXER_HEAD,
+                    DS4_N_INDEXER_HEAD_DIM, ratio, pos_hi) ||
+                !ds4_gpu_indexer_topk_tensor(s->idx_topk, s->idx_scores,
+                                             mm_blocks, n_tokens, tk_eff) ||
+                !ds4_gpu_qwen4exp_mm_select(
+                    s->idx_selected, s->idx_counts, s->idx_topk,
+                    s->mm->d_cell_pos, s->mm->d_cell_blk,
+                    s->mm->d_blk_filled, s->mm->d_row_pos,
+                    n_tokens, mm_blocks, tk_eff, ratio, max_selected,
+                    n_cells, s->mm->n_rows)) {
+                fprintf(stderr,
+                        "ds4: qwen4exp mm indexer selection failed at block %u\n",
+                        il);
+                return false;
+            }
+        } else if (!ds4_gpu_qwen4exp_rope_head_tensor(s->idx_q, s->inv_freq, n_tokens,
                                                DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM,
                                                DS4_N_ROT, pos0) ||
             !ds4_gpu_qwen4exp_qsa_indexer_scores_tensor(
@@ -3236,6 +3327,14 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
                 s->plan.n_ctx);
         return false;
     }
+    if (s->mm) {
+        if ((uint64_t)s->mm->n_rows + n_tokens > s->plan.n_ctx) {
+            fprintf(stderr,
+                    "ds4: qwen4exp forward would pass the session context %u "
+                    "(mm cells)\n", s->plan.n_ctx);
+            return false;
+        }
+    }
 
     /* From here on this call writes the caches, the recurrent states, the
      * convolution histories and `pos`; see `state_dirty`. */
@@ -3363,7 +3462,18 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         }
         s->adopt_device = s->adopt_state;
     }
-    if (s->d_pos && !ds4_gpu_qwen4exp_update_dpos(s->d_pos, s->pos)) {
+    /* mm rows: the device position scalar drives SLOT-indexed ops (KV
+     * append, tape append, attention prefix), so it gets n_rows, not pos.
+     * The row_pos table carries the logical positions. */
+    if (s->mm_pending && s->mm &&
+        !ds4_qwen4exp_mm_upload(s->mm, s->mm->pend_pos,
+                                s->mm->pend_embd, s->mm->pend_map,
+                                n_tokens, NULL, 0)) {
+        fprintf(stderr, "ds4: qwen4exp mm row upload failed\n");
+        return false;
+    }
+    if (s->d_pos && !ds4_gpu_qwen4exp_update_dpos(
+            s->d_pos, s->mm ? s->mm->n_rows : s->pos)) {
         fprintf(stderr, "ds4: qwen4exp position update failed\n");
         return false;
     }
@@ -3379,6 +3489,13 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
             QW_OFF(w->token_embd), w->token_embd->type, cfg->n_vocab,
             n_tokens, DS4_N_EMBD, DS4_N_HC)) {
         fprintf(stderr, "ds4: qwen4exp embedding gather failed\n");
+        return qwen4exp_forward_fail();
+    }
+    if (s->mm_pending && s->mm &&
+        !ds4_gpu_qwen4exp_mm_embd_rows(
+            s->hyper, s->mm->d_row_embd, s->mm->d_embd_map,
+            n_tokens, DS4_N_EMBD, DS4_N_HC, s->mm->row_cap)) {
+        fprintf(stderr, "ds4: qwen4exp mm embedding splice failed\n");
         return qwen4exp_forward_fail();
     }
     QW_TRACE(QW_SLICE_EMBED);
@@ -3516,7 +3633,11 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         return false;
     }
 
+    /* s->pos is the dense slot cursor and always advances by n_tokens;
+     * the M-RoPE t cursor lives in mm->t. */
     s->pos += n_tokens;
+    if (s->mm) ds4_qwen4exp_mm_commit(s->mm, n_tokens);
+    s->mm_pending = 0;
     if (wall_t0 != 0.0) {
         fprintf(stderr, "ds4: qwen4exp forward wall: %u rows in %.3f ms\n",
                 n_tokens, (now_sec() - wall_t0) * 1000.0);

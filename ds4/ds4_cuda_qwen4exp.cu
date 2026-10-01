@@ -4938,6 +4938,30 @@ __global__ static void qwen4exp_moe_group_scatter_kernel(
     const int32_t at = atomicAdd(&cursor[e], 1);
     pairs[at] = (int32_t)p;
 }
+/* The atomic scatter above leaves each expert's pair list in GPU-arrival
+ * order, and the downstream per-token expert sums iterate pairs in that
+ * order -- identical prompts then produce different logits run-to-run.
+ * Sorting each expert's slice ascending restores the deterministic
+ * token-major order the single-block small-group fill produces.  One block
+ * per expert, insertion sort (counts are ~n_pairs/n_total_expert ~ tens). */
+__global__ static void qwen4exp_moe_pair_sort_kernel(
+        int32_t *pairs,
+        const int32_t *offsets,
+        const int32_t *counts) {
+    const uint32_t e = blockIdx.x;
+    const int32_t base = offsets[e];
+    const int32_t n = counts[e];
+    if (threadIdx.x != 0 || n <= 1) return;
+    for (int32_t i = 1; i < n; i++) {
+        const int32_t v = pairs[base + i];
+        int32_t j = i - 1;
+        while (j >= 0 && pairs[base + j] > v) {
+            pairs[base + j + 1] = pairs[base + j];
+            j--;
+        }
+        pairs[base + j + 1] = v;
+    }
+}
 
 /* A pair whose expert id is out of range contributes nothing and its mid row
  * reads zero, which is what the per-token kernel wrote for it.  The grouped
@@ -10587,6 +10611,10 @@ static int qwen4exp_routed_moe_cuda(
         qwen4exp_moe_group_scatter_kernel<<<pair_blocks, threads, 0, stream>>>(
                 sc.pairs, sc.cursor, (const int32_t *)selected->ptr,
                 n_total_expert, n_pairs);
+        if (getenv("DS4_QWEN4EXP_MOE_UNORDERED_PAIRS") == NULL) {
+            qwen4exp_moe_pair_sort_kernel<<<n_total_expert, 32, 0, stream>>>(
+                    sc.pairs, sc.offsets, sc.counts);
+        }
     }
     if (!small_group) {
         qwen4exp_moe_zero_invalid_kernel<<<n_pairs, threads, 0, stream>>>(

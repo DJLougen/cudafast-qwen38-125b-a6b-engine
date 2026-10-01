@@ -5921,6 +5921,10 @@ static bool dsml_parse_nested_params_object(const char **p_in,
     return true;
 }
 
+static const char *ds4_lstrip_ws(const char *s) {
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
+    return s;
+}
 static void split_reasoning_content(const char *text, size_t n, char **content_out, char **reasoning_out) {
     char *s = xstrndup(text ? text : "", n);
     char *body = s;
@@ -5929,11 +5933,14 @@ static void split_reasoning_content(const char *text, size_t n, char **content_o
     char *think_end = strstr(body, "</think>");
     if (think_end) {
         *think_end = '\0';
-        *reasoning_out = xstrdup(body);
-        *content_out = xstrdup(think_end + 8);
+        /* llama-server parity: reasoning and content are emitted without
+         * the template whitespace padding around </think> (the model's
+         * "\n</think>\n\n" separator must not leak into either field). */
+        *reasoning_out = xstrdup(ds4_lstrip_ws(body));
+        *content_out = xstrdup(ds4_lstrip_ws(think_end + 8));
     } else {
         *reasoning_out = NULL;
-        *content_out = xstrdup(s);
+        *content_out = xstrdup(ds4_lstrip_ws(s));
     }
     free(s);
 }
