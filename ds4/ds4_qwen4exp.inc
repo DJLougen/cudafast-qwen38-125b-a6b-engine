@@ -742,6 +742,11 @@ typedef struct {
     uint32_t type[DS4_QWEN4EXP_MAX_TYPES];
     uint32_t n_type;
     ds4_qwen4exp_mem_family family;
+    /* When ndim==1: also accept a rank-2 tensor whose second dim is 1 -- the
+     * lowbitflash run1/run2 GGUFs write the shared-expert gate vector as
+     * (2560, 1) while the reference carries (2560,).  Same bytes, same
+     * semantics; only this spec opts in. */
+    uint32_t allow_trailing_1;
 } qwen4exp_tensor_spec;
 
 static void qwen4exp_plan_charge(ds4_qwen4exp_mem_plan *plan,
@@ -786,8 +791,12 @@ static ds4_tensor *qwen4exp_bind(const ds4_model *m,
     }
 
     if (t->ndim != spec->ndim) {
-        qwen4exp_die("tensor %s has rank %u, expected %u",
-                     spec->name, t->ndim, spec->ndim);
+        if (!(spec->ndim == 1u && spec->allow_trailing_1 &&
+              t->ndim == 2u && t->dim[1] == 1u)) {
+            qwen4exp_die("tensor %s has rank %u, expected %u",
+                         spec->name, t->ndim, spec->ndim);
+        }
+        /* squeezed rank-2 (…, 1) falls through to the dim-0 check below */
     }
     for (uint32_t d = 0; d < spec->ndim; d++) {
         if (t->dim[d] != spec->dim[d]) {
@@ -807,6 +816,10 @@ static ds4_tensor *qwen4exp_bind(const ds4_model *m,
 #define QW_SPEC2(nm, t0, d0, d1, fam) \
     ((qwen4exp_tensor_spec){ .name = (nm), .ndim = 2, .dim = { (d0), (d1) }, \
                              .type = { (t0) }, .n_type = 1, .family = (fam) })
+#define QW_SPEC1_SQUEEZE(nm, t0, d0, fam) \
+    ((qwen4exp_tensor_spec){ .name = (nm), .ndim = 1, .dim = { (d0) }, \
+                             .type = { (t0) }, .n_type = 1, .family = (fam), \
+                             .allow_trailing_1 = 1 })
 #define QW_SPEC3(nm, t0, d0, d1, d2, fam) \
     ((qwen4exp_tensor_spec){ .name = (nm), .ndim = 3, \
                              .dim = { (d0), (d1), (d2) }, \
@@ -956,7 +969,8 @@ static void qwen4exp_bind_block_tensors(ds4_qwen4exp_layer_weights *l,
                                DS4_QWEN4EXP_MEM_EXPERTS), QW_EXP_TYPES));
 
     qwen4exp_name(nm, sizeof(nm), "blk.%u.ffn_gate_inp_shexp.weight", il);
-    l->ffn_gate_inp_shexp = qwen4exp_bind(m, plan, QW_SPEC1(nm, DS4_TENSOR_F32,
+    l->ffn_gate_inp_shexp = qwen4exp_bind(m, plan,
+            QW_SPEC1_SQUEEZE(nm, DS4_TENSOR_F32,
             n_embd, DS4_QWEN4EXP_MEM_ROUTER));
     qwen4exp_name(nm, sizeof(nm), "blk.%u.ffn_gate_shexp.weight", il);
     l->ffn_gate_shexp = qwen4exp_bind(m, plan, QW_SPEC2(nm, DS4_TENSOR_Q8_0,
