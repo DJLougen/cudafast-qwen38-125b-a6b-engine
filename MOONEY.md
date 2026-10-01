@@ -15,7 +15,7 @@ Our delta adds what Mooney's GGUF needs:
 - `lowbitflash.rot.*` rotation metadata (fail-closed parsing) plus fused
   segmented-FWHT rotation kernels;
 - Q8_0 PLE n-gram tables (lazily read from SSD);
-- MTP speculative decoding with the `mtp-…-Q8_0.gguf` draft head
+- MTP speculative decoding with the `mtp-Qwen3.8-Flash-Next.gguf` (Q8_0) draft head
   (`--mtp-model` / `--mtp-draft`);
 - ChatML/qwen4exp serving fixes and GB10 (sm_121) build fixes.
 
@@ -49,9 +49,9 @@ Run:
 
 ```bash
 ds4/ds4-server \
-  -m Qwen3.8-Flash-Next-Mooney-00001-of-00004.gguf \
-  --vision mmproj-Qwen3.8-Flash-Next-Mooney-BF16.gguf \
-  --mtp-model mtp-Qwen3.8-Flash-Next-Q8_0.gguf --mtp-draft 2 \
+  -m Qwen3.8-Flash-Next-Mooney-PQ2_0-00001-of-00004.gguf \
+  --vision mmproj-Qwen3.8-Flash-Next-Mooney.gguf \
+  --mtp-model mtp-Qwen3.8-Flash-Next.gguf --mtp-draft 2 \
   --cuda --ctx 32768 --host 127.0.0.1 --port 8000
 ```
 
