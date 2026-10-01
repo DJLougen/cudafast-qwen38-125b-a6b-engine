@@ -40358,27 +40358,53 @@ static void encode_chat_prompt(
                     "(<|im_start|>, <|im_end|>, <think>, </think>); "
                     "pass --raw-prompt or --prompt-ids-file");
         }
-        if (think || (system && system[0])) {
+        /* Jinja |trim the system text, then:
+         *   think+content: "<|im_start|>system\n" + reasoning + "\n\n" + content
+         *   think only:    "<|im_start|>system\n" + reasoning  (no \n\n)
+         *   content only:  "<|im_start|>system\n" + content
+         *   neither:       no system block at all. */
+        char *sys_text = NULL;
+        if (system && system[0]) {
+            const char *s = system;
+            while (*s && isspace((unsigned char)*s)) s++;
+            size_t n = strlen(s);
+            while (n > 0 && isspace((unsigned char)s[n - 1])) n--;
+            sys_text = xmalloc(n + 1);
+            memcpy(sys_text, s, n);
+            sys_text[n] = '\0';
+        }
+        if (think || (sys_text && sys_text[0])) {
             token_vec_push(out, vocab->im_start_id);
+            bpe_tokenize_text(vocab, "system\n", out);
             if (think) {
-                /* tokenizer.chat_template's reasoning_effort default is
-                 * 'xhigh'; both DS4 think levels map to it (the 'low' and
-                 * empty 'medium' wordings are not reachable from the CLI). */
                 bpe_tokenize_text(vocab,
-                    "system\nReasoning effort is set to xhigh. Please think carefully "
+                    "Reasoning effort is set to xhigh. Please think carefully "
                     "through the task, validate key assumptions, consider plausible "
                     "alternatives, and prioritize correctness, consistency, and "
-                    "clarity in the final answer.\n\n", out);
-            } else {
-                bpe_tokenize_text(vocab, "system\n", out);
+                    "clarity in the final answer.", out);
             }
-            if (system && system[0]) bpe_tokenize_text(vocab, system, out);
+            if (sys_text && sys_text[0]) {
+                if (think) bpe_tokenize_text(vocab, "\n\n", out);
+                bpe_tokenize_text(vocab, sys_text, out);
+            }
             token_vec_push(out, vocab->im_end_id);
             bpe_tokenize_text(vocab, "\n", out);
         }
+        free(sys_text);
         token_vec_push(out, vocab->im_start_id);
         bpe_tokenize_text(vocab, "user\n", out);
-        bpe_tokenize_text(vocab, prompt, out);
+        {
+            /* content|trim, matching the template's user branch */
+            const char *u = prompt;
+            while (*u && isspace((unsigned char)*u)) u++;
+            size_t un = strlen(u);
+            while (un > 0 && isspace((unsigned char)u[un - 1])) un--;
+            char *ut = xmalloc(un + 1);
+            memcpy(ut, u, un);
+            ut[un] = '\0';
+            bpe_tokenize_text(vocab, ut, out);
+            free(ut);
+        }
         token_vec_push(out, vocab->im_end_id);
         bpe_tokenize_text(vocab, "\n", out);
         token_vec_push(out, vocab->im_start_id);
@@ -58209,6 +58235,32 @@ int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *f
     tokenize_rendered_chat_vocab(&vocab, text ? text : "", &tokens);
 
     dump_tokens_fp(fp, &vocab, &tokens);
+    token_vec_free(&tokens);
+    vocab_free(&vocab);
+    model_close(&model);
+    return 0;
+}
+
+/* Space-separated token ids only -- the machine-readable variant of
+ * ds4_dump_text_tokenization used by the render-fixture harness to diff ds4
+ * ids against the reference tokenizer's.  Same vocab + same
+ * tokenize_rendered_chat_vocab special-token splitting the server uses. */
+int ds4_dump_rendered_token_ids(const char *model_path, const char *text,
+                                FILE *fp) {
+    ds4_model model;
+    ds4_vocab vocab;
+    token_vec tokens = {0};
+
+    if (!fp) fp = stdout;
+    model_open(&model, model_path, false, false);
+    config_validate_model(&model);
+    vocab_load(&vocab, &model);
+    tokenize_rendered_chat_vocab(&vocab, text ? text : "", &tokens);
+
+    for (int i = 0; i < tokens.len; i++) {
+        fprintf(fp, "%s%d", i ? " " : "", tokens.v[i]);
+    }
+    fputc('\n', fp);
     token_vec_free(&tokens);
     vocab_free(&vocab);
     model_close(&model);
