@@ -931,7 +931,15 @@ ds4_qwen4exp_session *ds4_qwen4exp_session_open(
             (uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT * cfg->n_vocab * f, &ok);
     s->spec_top1     = qwen4exp_alloc_zeroed(
             ((uint64_t)DS4_QWEN4EXP_MTP_MAX_COMMIT + 1u) * sizeof(int32_t), &ok);
-    if (ok && getenv("DS4_QWEN4EXP_NO_TARGET_NATIVE_SCREEN") == NULL &&
+    /* The 2-row target LM-head screen ranks the vocabulary approximately and
+     * only recomputes a 16384-id shortlist.  Measured on Mooney (2026-10-01):
+     * with it, --mtp-draft 2 greedy output diverged from serial on 11/15
+     * prompts (first flip at generation step 5-12); without it all 15 were
+     * token-identical through 128k context.  So it is opt-in: set
+     * DS4_QWEN4EXP_TARGET_NATIVE_SCREEN=1 to trade exactness for speed.
+     * DS4_QWEN4EXP_NO_TARGET_NATIVE_SCREEN still forces it off. */
+    if (ok && getenv("DS4_QWEN4EXP_TARGET_NATIVE_SCREEN") != NULL &&
+        getenv("DS4_QWEN4EXP_NO_TARGET_NATIVE_SCREEN") == NULL &&
         ds4_gpu_mtp_native_screen2_init && ds4_gpu_mtp_native_screen2 &&
         ds4_gpu_mtp_native_scatter2) {
         uint64_t scratch2_bytes = 0;
