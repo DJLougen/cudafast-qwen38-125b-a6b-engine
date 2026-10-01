@@ -342,6 +342,9 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                                int min_expert_samples);
 void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens);
 int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp);
+/* ids-only variant for harness diffs (rendered chat incl. special tokens) */
+int ds4_dump_rendered_token_ids(const char *model_path, const char *text,
+                                FILE *fp);
 int ds4_dump_chat_tokenization(const char *model_path,
                                const char *system,
                                const char *prompt,
