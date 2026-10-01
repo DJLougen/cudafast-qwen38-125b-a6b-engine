@@ -223,6 +223,20 @@ static float mtp_env_margin(const char *name, float fallback) {
     return (end != v && x >= 0.0f) ? x : fallback;
 }
 
+/* DS4_MTP_TOKEN_LOG: the token ids the round committed, in commit order --
+ * the token-level identity check between a serial leg and its MTP leg that a
+ * text compare only approximates.  One line per round on stderr, same channel
+ * as the margin log. */
+static void mtp_token_log(const int *accepted, int n) {
+    char buf[192];
+    int len = snprintf(buf, sizeof(buf), "qwen4exp-mtp-commit n=%d t=", n);
+    for (int k = 0; k < n && len > 0 && len < (int)sizeof(buf) - 12; k++) {
+        len += snprintf(buf + len, sizeof(buf) - (size_t)len,
+                        k ? ",%d" : "%d", accepted[k]);
+    }
+    fprintf(stderr, "%s\n", buf);
+}
+
 /* DS4_QWEN4EXP_MTP_MARGIN_LOG: what the round offered, verified and accepted,
  * its verify and the following chain in ms, and the offered drafts' margins. */
 static void mtp_margin_log(const ds4_qwen4exp_mtp_state *st, int offered,
@@ -643,9 +657,14 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
     if (n < 1 || st->depth < 1) {
         const int rc = mtp_commit_one(st, model, first_token, pos,
                                       accepted, logits, NULL, err, errlen);
-        if (rc > 0 && st->margin_log) {
-            mtp_margin_log(st, n_offered, 0, 0, offered_margin,
-                           log_verify0, log_draft0);
+        if (rc > 0) {
+            if (st->margin_log) {
+                mtp_margin_log(st, n_offered, 0, 0, offered_margin,
+                               log_verify0, log_draft0);
+            }
+            if (getenv("DS4_MTP_TOKEN_LOG") != NULL) {
+                mtp_token_log(accepted, rc);
+            }
         }
         return rc;
     }
@@ -752,6 +771,9 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
             mtp_margin_log(st, n_offered, n, a, offered_margin,
                            log_verify0, log_draft0);
         }
+        if (getenv("DS4_MTP_TOKEN_LOG") != NULL) {
+            mtp_token_log(accepted, n + 1);
+        }
         return n + 1;
     }
 
@@ -796,6 +818,9 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
     if (st->margin_log) {
         mtp_margin_log(st, n_offered, n, a, offered_margin,
                        log_verify0, log_draft0);
+    }
+    if (getenv("DS4_MTP_TOKEN_LOG") != NULL) {
+        mtp_token_log(accepted, a + 1);
     }
     return a + 1;
 }
