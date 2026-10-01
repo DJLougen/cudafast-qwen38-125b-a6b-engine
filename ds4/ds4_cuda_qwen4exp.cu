@@ -10810,6 +10810,9 @@ static int qwen4exp_routed_moe_cuda(
     } else if (specialize && gate_slab->type == DS4_QWEN4EXP_TY_q8_0 && \
                              up_slab->type == DS4_QWEN4EXP_TY_q8_0) { \
         QWEN4EXP_GATEUP_IMPL(R, DS4_QWEN4EXP_TY_q8_0, DS4_QWEN4EXP_TY_q8_0); \
+    } else if (specialize && gate_slab->type == DS4_QWEN4EXP_TY_pq2_0 && \
+                             up_slab->type == DS4_QWEN4EXP_TY_pq2_0) { \
+        QWEN4EXP_GATEUP_IMPL(R, DS4_QWEN4EXP_TY_pq2_0, DS4_QWEN4EXP_TY_pq2_0); \
     } else { \
         QWEN4EXP_GATEUP_IMPL(R, -1, -1); \
     } \
@@ -11145,6 +11148,8 @@ static int qwen4exp_routed_moe_cuda(
         QWEN4EXP_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q5_1, false); \
     } else if (specialize && down_slab->type == DS4_QWEN4EXP_TY_q8_0) { \
         QWEN4EXP_DOWN_IMPL(R, DS4_QWEN4EXP_TY_q8_0, false); \
+    } else if (specialize && down_slab->type == DS4_QWEN4EXP_TY_pq2_0) { \
+        QWEN4EXP_DOWN_IMPL(R, DS4_QWEN4EXP_TY_pq2_0, false); \
     } else { \
         QWEN4EXP_DOWN_IMPL(R, -1, false); \
     } \
