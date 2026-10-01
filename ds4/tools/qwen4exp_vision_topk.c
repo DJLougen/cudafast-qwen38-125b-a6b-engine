@@ -11,11 +11,12 @@
 #include <stdlib.h>
 
 int main(int argc, char **argv) {
-    if (argc != 5) {
+    if (argc < 5) {
         fprintf(stderr, "usage: %s <model> <mmproj> <image> <question>\n",
                 argv[0]);
         return 2;
     }
+    const int reps = argc > 5 ? atoi(argv[5]) : 1;
     ds4_engine_options opt;
     memset(&opt, 0, sizeof(opt));
     opt.model_path  = argv[1];
@@ -49,7 +50,7 @@ int main(int argc, char **argv) {
         "<|im_start|>system\n"
         "Reasoning effort is set to xhigh. Please think carefully through the task, "
         "validate key assumptions, consider plausible alternatives, and prioritize "
-        "correctness, consistency, and clarity in the final answer.\n\n"
+        "correctness, consistency, and clarity in the final answer."
         "<|im_end|>\n"
         "<|im_start|>user\n";
     ds4_tokenize_rendered_chat(e, pre, &tok);
@@ -65,6 +66,17 @@ int main(int argc, char **argv) {
            tok.len, span.token_start,
            span.embedding.token_count, span.embedding.grid_width,
            span.embedding.grid_height);
+    if (getenv("DS4V_DUMP_TOKENS")) {
+        for (int i = 0; i < tok.len; i++) {
+            size_t dl = 0;
+            char *d = ds4_token_text(e, tok.v[i], &dl);
+            printf("tok[%d]=%d \"%.*s\"\n", i, tok.v[i],
+                   d ? (int)dl : 0, d ? d : "");
+            free(d);
+        }
+    }
+    for (int rep = 0; rep < reps; rep++) {
+    printf("=== rep %d\n", rep);
     ds4_session *s = NULL;
     if (ds4_session_create(&s, e, 8192) != 0 || !s) {
         fputs("session create failed\n", stderr);
@@ -91,6 +103,7 @@ int main(int argc, char **argv) {
         if (txt) free(txt);
     }
     ds4_session_free(s);
+    }
     ds4_engine_close(e);
     return 0;
 }
