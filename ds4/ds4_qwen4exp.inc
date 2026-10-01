@@ -217,6 +217,23 @@ static void qwen4exp_validate_layer_schedule(const ds4_model *m, uint32_t n_laye
             qwen4exp_die("qwen4exp.attention.compress_ratios holds %u entries "
                          "but the model has %u blocks", n, n_layer);
         }
+        /* lowbitflash run1/run2 convention: an all-zero table means the
+         * schedule is implicit and full_attention_interval alone decides
+         * which blocks are QSA (the converter's layer_types never named
+         * "full_attention", so the ratios all wrote 0).  Accept that form
+         * -- the interval KV below is still strictly checked -- but keep
+         * the explicit path's strictness: a MIXED table (any nonzero entry)
+         * must match the interval rule exactly or the file is refused. */
+        int any_nonzero = 0;
+        for (uint32_t il = 0; il < n_layer; il++) {
+            if (ratios[il] != 0) { any_nonzero = 1; break; }
+        }
+        if (!any_nonzero) {
+            fprintf(stderr, "ds4: qwen4exp attention.compress_ratios is "
+                    "all-zero; implicit schedule from "
+                    "full_attention_interval=%u\n", DS4_N_FULL_ATTN_INTERVAL);
+            return;
+        }
         for (uint32_t il = 0; il < n_layer; il++) {
             const bool qsa = ds4_qwen4exp_layer_is_full_attention(il);
             const uint64_t expected =
