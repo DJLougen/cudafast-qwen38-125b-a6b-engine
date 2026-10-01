@@ -61,6 +61,8 @@ static bool cli_greedy_argmax_requested(bool speculative_requested) {
 typedef struct {
     const char *prompt;
     const char *system;
+    /* Exact token ids for the prompt; when set, beats --raw/--chat. */
+    const char *prompt_ids_file;
     bool raw_prompt;
     /* Keep only the first N prompt tokens.  0 means the whole prompt. */
     int prompt_tokens;
@@ -500,7 +502,36 @@ static void print_generated_token(void *ud, int token) {
     free(text);
 }
 
+static void build_prompt_ids_file(const char *path, ds4_tokens *out) {
+    /* Whitespace/comma-separated decimal token ids, one per value.  This is
+     * the exact-id prompt entry used for cross-engine identity tests: the
+     * needle/longctx fixtures ship .npy id arrays and re-tokenizing rendered
+     * chat text can round-trip badly, so a comparison must feed the same ids
+     * to both engines. */
+    char *text = read_prompt_file(path, true);
+    char *p = text;
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ',') p++;
+        if (!*p) break;
+        char *end = NULL;
+        long v = strtol(p, &end, 10);
+        if (end == p || v < 0 || v > INT32_MAX) {
+            fprintf(stderr, "ds4: bad token id in --prompt-ids-file %s near '%.12s'\n",
+                    path, p);
+            free(text);
+            exit(2);
+        }
+        ds4_tokens_push(out, (int)v);
+        p = end;
+    }
+    free(text);
+}
+
 static void build_prompt(ds4_engine *engine, const cli_generation_options *gen, ds4_tokens *out) {
+    if (gen->prompt_ids_file) {
+        build_prompt_ids_file(gen->prompt_ids_file, out);
+        return;
+    }
     if (gen->raw_prompt) {
         ds4_tokenize_text(engine, gen->prompt ? gen->prompt : "", out);
     } else if (is_rendered_chat_prompt(gen->prompt)) {
@@ -635,6 +666,13 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                 return 1;
             }
         } else {
+            /* DS4_MTP_TOKEN_LOG also names this leg: the serial path prints
+             * one line per emitted token so a token-level diff against an MTP
+             * leg's "qwen4exp-mtp-commit" lines is possible without trusting
+             * the rendered text. */
+            if (getenv("DS4_MTP_TOKEN_LOG") != NULL) {
+                fprintf(stderr, "qwen4exp-commit n=1 t=%d\n", token);
+            }
             size_t piece_len = 0;
             char *piece = ds4_token_text(engine, token, &piece_len);
             token_printer_write_text(&printer, piece, piece_len);
@@ -2004,6 +2042,12 @@ static cli_config parse_options(int argc, char **argv) {
             }
             c.prompt_owned = read_prompt_file(need_arg(&i, argc, argv, arg), true);
             c.gen.prompt = c.prompt_owned;
+        } else if (!strcmp(arg, "--prompt-ids-file")) {
+            if (c.gen.prompt || c.gen.prompt_ids_file) {
+                fprintf(stderr, "ds4: specify only one prompt source\n");
+                exit(2);
+            }
+            c.gen.prompt_ids_file = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--prompt-tokens")) {
@@ -2388,7 +2432,7 @@ int main(int argc, char **argv) {
                                         cfg.gen.imatrix_min_expert_samples);
     } else if (cfg.gen.perplexity_file_path) {
         rc = run_perplexity_file(engine, &cfg);
-    } else if (cfg.gen.prompt == NULL) {
+    } else if (cfg.gen.prompt == NULL && cfg.gen.prompt_ids_file == NULL) {
         rc = run_repl(engine, &cfg);
     } else {
         rc = run_generation(engine, &cfg);
