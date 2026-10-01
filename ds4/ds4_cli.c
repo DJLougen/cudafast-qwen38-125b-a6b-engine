@@ -366,6 +366,7 @@ static bool is_rendered_chat_prompt(const char *prompt) {
         "[gMASK]",
         "<sop>",
         "<|system|>",
+        "<|im_start|>",
         "<|user|>",
         "<|assistant|>",
         "<|observation|>",
@@ -666,6 +667,13 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                 return 1;
             }
         } else {
+            /* DS4_MTP_TOKEN_LOG also names this leg: the serial path prints
+             * one line per emitted token so a token-level diff against an MTP
+             * leg's "qwen4exp-mtp-commit" lines is possible without trusting
+             * the rendered text. */
+            if (getenv("DS4_MTP_TOKEN_LOG") != NULL) {
+                fprintf(stderr, "qwen4exp-commit n=1 t=%d\n", token);
+            }
             size_t piece_len = 0;
             char *piece = ds4_token_text(engine, token, &piece_len);
             token_printer_write_text(&printer, piece, piece_len);
