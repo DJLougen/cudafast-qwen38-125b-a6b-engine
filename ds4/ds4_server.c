@@ -670,6 +670,7 @@ typedef enum {
 typedef enum {
     SERVER_MODEL_SYNTAX_DEEPSEEK,
     SERVER_MODEL_SYNTAX_GLM,
+    SERVER_MODEL_SYNTAX_QWEN4EXP,
 } server_model_syntax;
 
 static void random_tool_id(char *dst, size_t dstlen, api_style api) {
@@ -1128,11 +1129,13 @@ static bool model_alias_enables_thinking(const char *model) {
 }
 
 static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
+    if (ds4_engine_is_qwen4exp(engine)) return SERVER_MODEL_SYNTAX_QWEN4EXP;
     return ds4_engine_is_glm_dsa(engine) ?
            SERVER_MODEL_SYNTAX_GLM : SERVER_MODEL_SYNTAX_DEEPSEEK;
 }
 
 static const char *server_model_id_from_engine(ds4_engine *engine) {
+    if (ds4_engine_is_qwen4exp(engine)) return "qwen3.8-flash-next";
     if (ds4_engine_is_glm53(engine)) return "glm-5.3-flash";
     if (ds4_engine_is_glm_dsa(engine)) return "glm-5.2";
     return ds4_engine_model_id(engine) == 1 ?
@@ -3067,11 +3070,154 @@ static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
     return buf_take(&out);
 }
 
+/* Qwen4exp ChatML (tokenizer.chat_template):
+ *   - Optional leading system turn: "<|im_start|>system\n[reasoning\n\n][content]<|im_end|>\n"
+ *     (content empty -> block is still emitted empty when a system msg exists with
+ *      empty content and tools/thinking force one? No - empty-content leading
+ *      system is emitted only if reasoning_instructions or content non-empty;
+ *      a system msg with empty content and no tools emits "<|im_start|>system\n<|im_end|>\n").
+ *     Actually per template: if reasoning_instructions or tool_instructions set,
+ *     system block is ALWAYS emitted (even with no system msg); else only when
+ *     messages[0] is system with non-empty trimmed content.
+ *   - user:     "<|im_start|>user\n"      + content + "<|im_end|>\n"
+ *   - tool/func:"<|im_start|>user\n<tool_response>\n" + content + "\n</tool_response><|im_end|>\n"
+ *   - assistant:"<|im_start|>assistant\n" + ["<think>\n"+reasoning+"\n</think>\n\n"] +
+ *               [tool_call blocks if any + "\n"] + content + "<|im_end|>\n"
+ *   - final:    "<|im_start|>assistant\n" + ("<think>\n" when thinking, else nothing)
+ *
+ * tool_schemas here are newline-separated function-schema JSON objects
+ * (parse_tools_value output); the template joins them the same way inside
+ * <tools>...</tools>. */
+static void qwen4exp_reasoning_instructions(buf *b, ds4_think_mode think_mode) {
+    if (!ds4_think_mode_enabled(think_mode)) return;
+    /* Template: 'medium' resolves to empty instructions; 'low' and 'high' have
+     * fixed strings. DS4 exposes NONE/HIGH/MAX - HIGH and MAX both map to the
+     * template's 'high' wording. */
+    buf_puts(b,
+        "Reasoning effort is set to xhigh. Please think carefully through the task, "
+        "validate key assumptions, consider plausible alternatives, and prioritize "
+        "correctness, consistency, and clarity in the final answer.");
+}
+
+static void qwen4exp_append_tool_call_text(buf *b, const tool_call *tc) {
+    /* <tool_call>\n<function=NAME>\n{"arg":"val",...}\n</function>\n</tool_call>\n
+     * is NOT the form; the template emits JSON arguments verbatim after the
+     * function header line: the assistant produces arguments as a JSON object
+     * on the following line(s). */
+    buf_puts(b, "<tool_call>\n<function=");
+    buf_puts(b, tc->name ? tc->name : "");
+    buf_puts(b, ">\n");
+    buf_puts(b, tc->arguments ? tc->arguments : "{}");
+    buf_puts(b, "\n</function>\n</tool_call>");
+}
+
+static char *render_qwen4exp_chat_prompt_text(const chat_msgs *msgs,
+                                              const char *tool_schemas,
+                                              const tool_schema_orders *tool_orders,
+                                              ds4_think_mode think_mode) {
+    (void)tool_orders;
+    const bool thinking = ds4_think_mode_enabled(think_mode);
+    const bool has_tools = tool_schemas && tool_schemas[0];
+    buf b = {0};
+
+    /* Leading system block */
+    const chat_msg *sys = NULL;
+    int start = 0;
+    if (msgs && msgs->len > 0 && role_is_system(msgs->v[0].role)) {
+        sys = &msgs->v[0];
+        start = 1;
+    }
+    const char *sys_content = (sys && sys->content) ? sys->content : "";
+    if (thinking || has_tools || sys_content[0]) {
+        buf_puts(&b, "<|im_start|>system\n");
+        if (thinking) {
+            qwen4exp_reasoning_instructions(&b, think_mode);
+            buf_puts(&b, "\n\n");
+        }
+        if (has_tools) {
+            buf_puts(&b,
+                "# Tools\n\nYou have access to the following functions:\n\n<tools>");
+            /* tool_schemas already carries one function JSON object per line */
+            const char *p = tool_schemas;
+            while (*p) {
+                buf_putc(&b, '\n');
+                const char *eol = strchr(p, '\n');
+                if (eol) { buf_append(&b, p, (size_t)(eol - p)); p = eol + 1; }
+                else     { buf_puts(&b, p); break; }
+            }
+            buf_puts(&b, "\n</tools>\n\n"
+                "If you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+                "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n"
+                "</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\n"
+                "that can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n"
+                "<IMPORTANT>\nReminder:\n"
+                "- Function calls MUST follow the specified format: an inner <function=...></function> "
+                "block must be nested within <tool_call></tool_call> XML tags\n"
+                "- Required parameters MUST be specified\n"
+                "- You may provide optional reasoning for your function call in natural language BEFORE "
+                "the function call, but NOT after\n"
+                "- If there is no function call available, answer the question like normal with your "
+                "current knowledge and do not tell the user about function calls\n</IMPORTANT>");
+        }
+        if (sys_content[0]) {
+            buf_puts(&b, "\n\n");
+            buf_puts(&b, sys_content);
+        }
+        buf_puts(&b, "<|im_end|>\n");
+    }
+
+    /* Message turns */
+    for (int i = start; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (!m->role) continue;
+        if (!strcmp(m->role, "user")) {
+            buf_puts(&b, "<|im_start|>user\n");
+            if (m->content) buf_puts(&b, m->content);
+            buf_puts(&b, "<|im_end|>\n");
+        } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
+            buf_puts(&b, "<|im_start|>user\n<tool_response>\n");
+            if (m->content) buf_puts(&b, m->content);
+            buf_puts(&b, "\n</tool_response><|im_end|>\n");
+        } else if (!strcmp(m->role, "assistant")) {
+            buf_puts(&b, "<|im_start|>assistant\n");
+            if (m->reasoning && m->reasoning[0]) {
+                buf_puts(&b, "<think>\n");
+                buf_puts(&b, m->reasoning);
+                buf_puts(&b, "\n</think>\n\n");
+            }
+            for (int t = 0; t < m->calls.len; t++) {
+                qwen4exp_append_tool_call_text(&b, &m->calls.v[t]);
+                buf_putc(&b, '\n');
+            }
+            if (m->content) buf_puts(&b, m->content);
+            buf_puts(&b, "<|im_end|>\n");
+        } else {
+            /* Any other role (developer already folded into system via
+             * role_is_system for msgs[0]; later system/developer turns become
+             * a generic role turn matching the template's else-branch) */
+            buf_puts(&b, "<|im_start|>");
+            buf_puts(&b, m->role);
+            buf_putc(&b, '\n');
+            if (m->content) buf_puts(&b, m->content);
+            buf_puts(&b, "<|im_end|>\n");
+        }
+    }
+
+    /* Generation prefix */
+    buf_puts(&b, "<|im_start|>assistant\n");
+    if (thinking) buf_puts(&b, "<think>\n");
+    return buf_take(&b);
+}
+
 static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
                                                 const chat_msgs *msgs,
                                                 const char *tool_schemas,
                                                 const tool_schema_orders *tool_orders,
                                                 ds4_think_mode think_mode) {
+    if (syntax == SERVER_MODEL_SYNTAX_QWEN4EXP) {
+        return render_qwen4exp_chat_prompt_text(msgs, tool_schemas,
+                                                tool_orders, think_mode);
+    }
     if (syntax == SERVER_MODEL_SYNTAX_GLM) {
         return render_glm_chat_prompt_text(msgs, tool_schemas,
                                            tool_orders, think_mode);

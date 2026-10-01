@@ -39233,6 +39233,15 @@ struct ds4_vocab {
     int arg_value_start_id;
     int arg_value_end_id;
     int dsml_id;
+
+    /* ChatML (Qwen) specials -- qwen4exp is family-tagged GLM_DSA but uses
+     * <|im_start|>/<|im_end|> role markers and <|vision_*|> image spans. */
+    int im_start_id;
+    int im_end_id;
+    int vision_start_id;
+    int vision_end_id;
+    int image_pad_id;
+    int video_pad_id;
     str_i32_table token_to_id;
     str_i32_table merge_rank;
 };
@@ -40203,6 +40212,14 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         vocab->arg_key_end_id = vocab_lookup_optional(vocab, "</arg_key>");
         vocab->arg_value_start_id = vocab_lookup_optional(vocab, "<arg_value>");
         vocab->arg_value_end_id = vocab_lookup_optional(vocab, "</arg_value>");
+        /* ChatML specials: qwen4exp lives in this family but templates with
+         * <|im_start|>/<|im_end|>; they stay -1 on real GLM models. */
+        vocab->im_start_id     = vocab_lookup_optional(vocab, "<|im_start|>");
+        vocab->im_end_id       = vocab_lookup_optional(vocab, "<|im_end|>");
+        vocab->vision_start_id = vocab_lookup_optional(vocab, "<|vision_start|>");
+        vocab->vision_end_id   = vocab_lookup_optional(vocab, "<|vision_end|>");
+        vocab->image_pad_id    = vocab_lookup_optional(vocab, "<|image_pad|>");
+        vocab->video_pad_id    = vocab_lookup_optional(vocab, "<|video_pad|>");
         vocab->dsml_id = -1;
         return;
     }
@@ -40225,6 +40242,12 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     vocab->arg_value_start_id = -1;
     vocab->arg_value_end_id = -1;
     vocab->dsml_id = vocab_lookup(vocab, "｜DSML｜");
+    vocab->im_start_id = -1;
+    vocab->im_end_id = -1;
+    vocab->vision_start_id = -1;
+    vocab->vision_end_id = -1;
+    vocab->image_pad_id = -1;
+    vocab->video_pad_id = -1;
 }
 
 static void vocab_free(ds4_vocab *vocab) {
@@ -40282,12 +40305,13 @@ static void encode_chat_prompt(
      * A base or experimental artifact having no chat markers is ordinary; the
      * refusal is right, and the CLI must not quietly reformat the prompt
      * instead, because that would change what a scored run measures. */
-    if (vocab->bos_id < 0 ||
+    if (DS4_MODEL_VARIANT != DS4_VARIANT_QWEN4EXP &&
+        (vocab->bos_id < 0 ||
         vocab->user_id < 0 ||
         vocab->assistant_id < 0 ||
         vocab->think_end_id < 0 ||
         (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA && vocab->system_id < 0) ||
-        (need_think_start && vocab->think_start_id < 0)) {
+        (need_think_start && vocab->think_start_id < 0))) {
         char missing[192];
         size_t used = 0;
         missing[0] = '\0';
@@ -40319,6 +40343,55 @@ static void encode_chat_prompt(
                  missing[0] ? missing : "chat",
                  strchr(missing, ',') ? "s" : "");
         ds4_die(why);
+    }
+
+    /* Qwen4exp renders ChatML from tokenizer.chat_template: no BOS token,
+     * role markers are <|im_start|>name\n ... <|im_end|>\n, an optional
+     * leading system block (reasoning instructions when thinking is on,
+     * plus the caller's system text), and a generation prefix of
+     * "<|im_start|>assistant\n<think>\n" or "<think>\n\n</think>\n\n". */
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_QWEN4EXP) {
+        const bool think = ds4_think_mode_enabled(think_mode);
+        if (vocab->im_start_id < 0 || vocab->im_end_id < 0 ||
+            vocab->think_start_id < 0 || vocab->think_end_id < 0) {
+            ds4_die("qwen4exp tokenizer is missing ChatML markers "
+                    "(<|im_start|>, <|im_end|>, <think>, </think>); "
+                    "pass --raw-prompt or --prompt-ids-file");
+        }
+        if (think || (system && system[0])) {
+            token_vec_push(out, vocab->im_start_id);
+            if (think) {
+                /* tokenizer.chat_template's reasoning_effort default is
+                 * 'xhigh'; both DS4 think levels map to it (the 'low' and
+                 * empty 'medium' wordings are not reachable from the CLI). */
+                bpe_tokenize_text(vocab,
+                    "system\nReasoning effort is set to xhigh. Please think carefully "
+                    "through the task, validate key assumptions, consider plausible "
+                    "alternatives, and prioritize correctness, consistency, and "
+                    "clarity in the final answer.\n\n", out);
+            } else {
+                bpe_tokenize_text(vocab, "system\n", out);
+            }
+            if (system && system[0]) bpe_tokenize_text(vocab, system, out);
+            token_vec_push(out, vocab->im_end_id);
+            bpe_tokenize_text(vocab, "\n", out);
+        }
+        token_vec_push(out, vocab->im_start_id);
+        bpe_tokenize_text(vocab, "user\n", out);
+        bpe_tokenize_text(vocab, prompt, out);
+        token_vec_push(out, vocab->im_end_id);
+        bpe_tokenize_text(vocab, "\n", out);
+        token_vec_push(out, vocab->im_start_id);
+        bpe_tokenize_text(vocab, "assistant\n", out);
+        token_vec_push(out, vocab->think_start_id);
+        if (think) {
+            bpe_tokenize_text(vocab, "\n", out);
+        } else {
+            bpe_tokenize_text(vocab, "\n\n", out);
+            token_vec_push(out, vocab->think_end_id);
+            bpe_tokenize_text(vocab, "\n\n", out);
+        }
+        return;
     }
 
     chat_push_bos_sequence(vocab, out);
@@ -40371,6 +40444,12 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
         {"<arg_value>",            vocab->arg_value_start_id},
         {"</arg_value>",           vocab->arg_value_end_id},
         {"｜DSML｜",                vocab->dsml_id},
+        {"<|im_start|>",           vocab->im_start_id},
+        {"<|im_end|>",             vocab->im_end_id},
+        {"<|vision_start|>",       vocab->vision_start_id},
+        {"<|vision_end|>",         vocab->vision_end_id},
+        {"<|image_pad|>",          vocab->image_pad_id},
+        {"<|video_pad|>",          vocab->video_pad_id},
     };
 
     for (size_t i = 0; i < sizeof(specials) / sizeof(specials[0]); i++) {
@@ -40519,6 +40598,21 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 
 
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
+    /* Qwen4exp (ChatML): "<|im_start|>assistant\n" then "<think>\n" or
+     * "<think>\n\n</think>\n\n" when thinking is off. */
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_QWEN4EXP) {
+        token_vec_push(tokens, e->vocab.im_start_id);
+        bpe_tokenize_text(&e->vocab, "assistant\n", tokens);
+        token_vec_push(tokens, e->vocab.think_start_id);
+        if (ds4_think_mode_enabled(think_mode)) {
+            bpe_tokenize_text(&e->vocab, "\n", tokens);
+        } else {
+            bpe_tokenize_text(&e->vocab, "\n\n", tokens);
+            token_vec_push(tokens, e->vocab.think_end_id);
+            bpe_tokenize_text(&e->vocab, "\n\n", tokens);
+        }
+        return;
+    }
     token_vec_push(tokens, e->vocab.assistant_id);
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
         !ds4_think_mode_enabled(think_mode)) {
@@ -40638,6 +40732,12 @@ char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
 static bool vocab_token_is_generation_stop(const ds4_vocab *vocab, int token) {
     if (!vocab || token < 0) return false;
     if (token == vocab->eos_id) return true;
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_QWEN4EXP) {
+        /* ChatML turn ends at <|im_end|>; <|endoftext|> is GGUF bos but also
+         * a hard stop for generation. */
+        return (vocab->im_end_id >= 0 && token == vocab->im_end_id) ||
+               (vocab->bos_id >= 0 && token == vocab->bos_id);
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         return (vocab->system_id >= 0 && token == vocab->system_id) ||
                (vocab->user_id >= 0 && token == vocab->user_id) ||
@@ -64857,6 +64957,11 @@ int ds4_engine_model_id(ds4_engine *e) {
 bool ds4_engine_is_glm53(ds4_engine *e) {
     (void)e;
     return ds4_model_is_glm53();
+}
+
+bool ds4_engine_is_qwen4exp(ds4_engine *e) {
+    (void)e;
+    return ds4_model_is_qwen4exp();
 }
 
 /* Decode gate firing schedule for the TP transport (see ds4_tp_identity).
