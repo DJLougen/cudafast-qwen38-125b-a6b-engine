@@ -12602,6 +12602,23 @@ static void *decode_worker_main(void *arg) {
  * shorter than the full prompt, we prefill to that boundary, store it, and
  * immediately continue to the real prompt.  The live graph therefore always
  * moves forward. */
+/* Whether a speculative batch left committed tokens the response never
+ * consumed.  `consumed` is the number of tokens appended this batch;
+ * `batch_len` is what the cycle committed.  Any remainder still sits in the
+ * session tail, so the turn's live state must not be remembered. */
+static bool server_batch_unconsumed(int consumed, int batch_len) {
+    return consumed < batch_len;
+}
+
+/* A turn's live state is reusable only when every committed token reached the
+ * response and the turn closed cleanly (not an error, not a token cap, not a
+ * cut batch). */
+static bool server_turn_rememberable(bool batch_cut_early,
+                                     const char *final_finish) {
+    return !batch_cut_early && final_finish &&
+           strcmp(final_finish, "error") && strcmp(final_finish, "length");
+}
+
 static void generate_job_inner(server *s, server_slot *slot, job *j) {
     char err[160];
     err[0] = '\0';
@@ -13126,13 +13143,11 @@ decode_again:
             snprintf(err, sizeof(err), "failed to select a non-EOS token");
             break;
         }
-        /* ignore_eos suppresses ONLY the EOS stop.  Thinking-control tokens
-         * (think start/end markers that no-thinking mode treats as stops)
-         * still terminate the decode, selected or committed. */
-        if ((!j->req.ignore_eos &&
-             ds4_token_is_stop(s->engine, token)) ||
-            (!ds4_think_mode_enabled(j->req.think_mode) &&
-             ds4_token_is_thinking_control(s->engine, token))) {
+        /* ignore_eos suppresses ONLY the eos_id stop; other generation stops
+         * (im_end, bos) and the no-thinking thinking-control stop still hold,
+         * at both this boundary and the batch-consumption one below. */
+        if (ds4_token_stops_decode(s->engine, token, j->req.think_mode,
+                                   j->req.ignore_eos)) {
             finish = "stop";
             break;
         }
@@ -13181,8 +13196,10 @@ decode_again:
         bool stop_decode = false;
         /* A speculative batch commits its tokens even when the consumer stops
          * partway (EOS, stop list, tool close, cancel): everything after the
-         * cut is still in the session and in the retained frontier.  ti is
-         * hoisted so an early exit is visible after the loop. */
+         * cut is still in the session and in the retained frontier.  Consumed
+         * tokens are counted via `completion` (a break never runs the for's
+         * increment, so ti underreports). */
+        const int batch_start_completion = completion;
         int ti = 0;
         for (; ti < ntok && completion < max_tokens; ti++) {
             if (job_cancelled(j)) {
@@ -13190,13 +13207,9 @@ decode_again:
                 break;
             }
             token = toks[ti];
-            /* Same split as the selection boundary: ignore_eos drops the EOS
-             * stop only; a committed batch's thinking-control tokens still
-             * stop the decode. */
-            if ((!j->req.ignore_eos &&
-                 ds4_token_is_stop(s->engine, token)) ||
-                (!ds4_think_mode_enabled(j->req.think_mode) &&
-                 ds4_token_is_thinking_control(s->engine, token))) {
+            /* The same one decision as the selection boundary. */
+            if (ds4_token_stops_decode(s->engine, token, j->req.think_mode,
+                                       j->req.ignore_eos)) {
                 finish = "stop";
                 stop_decode = true;
                 break;
@@ -13375,13 +13388,15 @@ decode_again:
                 break;
             }
         }
-        /* The batch committed tokens the response never consumed.  The
-         * session tail and the retained live frontier both describe text the
-         * client never saw, so remembering that frontier would make a later
-         * request replay an invisible suffix.  Invalidate the session and
-         * mark the cut; the live-state publishers below refuse to remember a
+        /* The batch committed tokens the response never consumed.  `ti` is
+         * not a reliable count here (a `break` never runs the increment), so
+         * measure what actually got appended: `completion` moves once per
+         * consumed token.  Any remainder is still committed in the session
+         * and in the retained frontier, so invalidate the session and mark
+         * the cut; the live-state publishers below refuse to remember a
          * frontier built on unseen tokens. */
-        if (ti < ntok) {
+        if (server_batch_unconsumed(completion - batch_start_completion,
+                                    ntok)) {
             pthread_mutex_lock(&s->inference_mu);
             ds4_session_invalidate(slot->session);
             pthread_mutex_unlock(&s->inference_mu);
@@ -13670,8 +13685,7 @@ decode_again:
      * turn as unrememberable so the next request re-prefills the visible
      * prompt instead of resuming from unseen tokens. */
     if (j->req.api == API_RESPONSES) {
-        if (!batch_cut_early &&
-            strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
+        if (server_turn_rememberable(batch_cut_early, final_finish)) {
             /* Store the post-turn visible transcript plus the live token
              * frontier.  The next Responses request may replay only this
              * visible surface, while the real session also contains hidden
@@ -13693,10 +13707,8 @@ decode_again:
         }
     }
     if (j->req.api == API_ANTHROPIC) {
-        if (!batch_cut_early && parsed_calls.len &&
-            strcmp(final_finish, "error") &&
-            strcmp(final_finish, "length"))
-        {
+        if (parsed_calls.len &&
+            server_turn_rememberable(batch_cut_early, final_finish)) {
             anthropic_live_remember(s, slot, &parsed_calls);
         } else {
             anthropic_live_clear(s, slot);
@@ -20108,6 +20120,40 @@ static void test_responses_inline_image_content(void) {
     buf_free(&json);
 }
 
+/* The batch-cut accounting behind batch_cut_early: `consumed` counts tokens
+ * that reached the response, `batch_len` is what the cycle committed.  A
+ * remainder -- EOS cut mid-batch, a tool close before the last token, a
+ * cancel, or the max_tokens guard exiting with a tail -- means unseen
+ * tokens are in the session and no live state may be remembered. */
+static void test_spec_batch_unconsumed(void) {
+    /* [fed, EOS, x]: the EOS at index 1 is consumed=1 of a 3-token batch. */
+    TEST_ASSERT(server_batch_unconsumed(1, 3));
+    /* Tool close on the last-but-one committed token. */
+    TEST_ASSERT(server_batch_unconsumed(2, 3));
+    /* Fully consumed batches do not cut, including serial ntok==1. */
+    TEST_ASSERT(!server_batch_unconsumed(3, 3));
+    TEST_ASSERT(!server_batch_unconsumed(1, 1));
+    /* Cancel before the batch's first token is consumed. */
+    TEST_ASSERT(server_batch_unconsumed(0, 3));
+    TEST_ASSERT(server_batch_unconsumed(0, 1));
+}
+
+/* The publishers' shared gate: a cut turn is never remembered, a clean turn
+ * is.  Reuse exists for normal completions, so the predicate must stay true
+ * when nothing was cut. */
+static void test_spec_turn_rememberable(void) {
+    /* Clean finishes are remembered. */
+    TEST_ASSERT(server_turn_rememberable(false, "stop"));
+    TEST_ASSERT(server_turn_rememberable(false, "tool_calls"));
+    /* A cut batch is never remembered, whatever the finish. */
+    TEST_ASSERT(!server_turn_rememberable(true, "stop"));
+    TEST_ASSERT(!server_turn_rememberable(true, "tool_calls"));
+    TEST_ASSERT(!server_turn_rememberable(true, "length"));
+    /* Error and length finishes never remember, cut or not. */
+    TEST_ASSERT(!server_turn_rememberable(false, "length"));
+    TEST_ASSERT(!server_turn_rememberable(false, "error"));
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
@@ -20240,6 +20286,8 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_score_decays_stale_hits();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
+    test_spec_batch_unconsumed();
+    test_spec_turn_rememberable();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN

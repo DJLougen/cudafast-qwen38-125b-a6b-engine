@@ -180,22 +180,30 @@ static int field_int(const char *line, const char *key, long long *out) {
     return 0;
 }
 
-/* Read the UNSIGNED integer value of `key` with full range and format
- * checking: strtoull with ERANGE, trailing garbage and a leading '-' all
- * fail.  field_int saturates at LLONG_MAX and ignores junk; seeds are uint64
- * and values above LLONG_MAX are legitimate, so they must not go through it.
- * Returns 0 on success. */
+/* Read the UNSIGNED integer value of `key` as a strict JSON integer:
+ * optional JSON whitespace, then a leading digit (no sign, no leading zero
+ * unless the value is exactly 0), all digits, then optional JSON whitespace
+ * and a real value delimiter (',' or '}').  Anything else -- '+', '-',
+ * floats, exponents, quotes, overflow past UINT64_MAX, trailing junk --
+ * fails.  field_int saturates at LLONG_MAX and ignores junk; seeds are
+ * uint64 and values above LLONG_MAX are legitimate, so they must not go
+ * through it.  Returns 0 on success. */
+static int json_ws(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
 static int field_u64(const char *line, const char *key, uint64_t *out) {
     const char *at = field(line, key);
     if (!at) return -1;
-    while (*at == ' ' || *at == '\t') at++;
-    if (*at == '-') return -1;
+    while (json_ws(*at)) at++;
+    if (*at < '0' || *at > '9') return -1;              /* no sign/exponent */
+    if (*at == '0' && at[1] >= '0' && at[1] <= '9') return -1; /* "01" */
     char *end = NULL;
     errno = 0;
     const unsigned long long v = strtoull(at, &end, 10);
     if (end == at || errno == ERANGE) return -1;
-    if (*end != ',' && *end != '}' && *end != ']' &&
-        *end != ' ' && *end != '\t' && *end != '\0') return -1;
+    while (json_ws(*end)) end++;
+    if (*end != ',' && *end != '}' && *end != '\0') return -1;
     *out = (uint64_t)v;
     return 0;
 }
@@ -619,6 +627,7 @@ static void unlink_socket(void) {
     if (g_socket_path[0]) unlink(g_socket_path);
 }
 
+#ifndef DS4_RESIDENT_TEST
 int main(void) {
     setvbuf(stderr, NULL, _IOLBF, 0);
 
@@ -768,3 +777,4 @@ int main(void) {
     if (ready_file) unlink(ready_file);
     return 0;
 }
+#endif /* DS4_RESIDENT_TEST */

@@ -40822,6 +40822,27 @@ bool ds4_token_is_stop_for_think_mode(
     return false;
 }
 
+bool ds4_token_stops_decode(
+        ds4_engine      *e,
+        int              token,
+        ds4_think_mode   mode,
+        bool             ignore_eos) {
+    /* EOS is the only stop ignore_eos is allowed to suppress.  Every other
+     * generation stop (im_end, bos, family markers) still applies. */
+    if (ds4_token_is_stop(e, token)) {
+        return !(ignore_eos && token == ds4_token_eos(e));
+    }
+    /* In no-thinking mode the prompt already supplied the protocol close tag.
+     * If the model emits another thinking tag, do not print or feed it back:
+     * it is a control marker, not assistant content, and ignore_eos does not
+     * protect it. */
+    if (!ds4_think_mode_enabled(mode) &&
+        ds4_token_is_thinking_control(e, token)) {
+        return true;
+    }
+    return false;
+}
+
 int ds4_token_user(ds4_engine *e) {
     return e->vocab.user_id;
 }
@@ -41662,6 +41683,38 @@ int ds4_test_argmax_excluding_logits(const float *logits, uint32_t n_vocab,
         }
     }
     return best;
+}
+
+/* A fabricated engine carrying only the stop-token vocabulary the stop
+ * helpers read, so the server's boundary truth table can be tested without a
+ * model.  ds4_token_stops_decode touches only e->vocab. */
+ds4_engine *ds4_test_engine_with_stop_ids(int eos, int im_end, int bos,
+                                          int think_start, int think_end) {
+    ds4_engine *e = xcalloc(1, sizeof(*e));
+    e->vocab.eos_id = eos;
+    e->vocab.im_end_id = im_end;
+    e->vocab.bos_id = bos;
+    e->vocab.think_start_id = think_start;
+    e->vocab.think_end_id = think_end;
+    return e;
+}
+
+void ds4_test_engine_free(ds4_engine *e) {
+    free(e);
+}
+
+/* Point DS4_MODEL_VARIANT at qwen4exp so stop-set tests exercise the family
+ * branch, returning the previous variant for the caller to restore.  The
+ * variant enum is file-private, so the hook takes no value. */
+int ds4_test_set_variant_qwen4exp(void) {
+    const int old = g_ds4_shape.variant;
+    g_ds4_shape.variant = DS4_VARIANT_QWEN4EXP;
+    return old;
+}
+
+/* Restore whatever ds4_test_set_variant_qwen4exp returned. */
+void ds4_test_restore_variant(int variant) {
+    g_ds4_shape.variant = variant;
 }
 #endif
 

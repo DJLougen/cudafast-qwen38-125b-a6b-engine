@@ -1103,3 +1103,15 @@ tests/test_qwen4exp_gdn_replay: tests/test_qwen4exp_gdn_replay.o $(GPU_TEST_OBJS
 
 test-qwen4exp-gdn-replay: tests/test_qwen4exp_gdn_replay
 	./tests/test_qwen4exp_gdn_replay
+
+# The resident shim's strict request-field parser, exercised against the
+# stub engine (no GPU, no model).
+tests/test_resident_fields.o: tests/test_resident_fields.c ../harness/protocol-adapter/ds4_shim/ds4_resident.c
+	$(CC) $(CFLAGS) -I. -I../harness/protocol-adapter/ds4_shim -DDS4_RESIDENT_TEST -c -o $@ tests/test_resident_fields.c
+
+tests/test_resident_fields: tests/test_resident_fields.o ../tools/ds4/resident-stub-engine.c
+	$(CC) $(CFLAGS) -I../harness/protocol-adapter/ds4_shim -o $@ tests/test_resident_fields.o ../tools/ds4/resident-stub-engine.c -lpthread
+
+.PHONY: test-resident-fields
+test-resident-fields: tests/test_resident_fields
+	./tests/test_resident_fields

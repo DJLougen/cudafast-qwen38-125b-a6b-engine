@@ -522,10 +522,59 @@ static void check_point_sample_chained(void) {
            DRAWS, df - 1, chi2, bound);
 }
 
+/* The decode-stop truth table both server boundaries share through
+ * ds4_token_stops_decode.  A fabricated engine carries the stop ids a
+ * qwen4exp vocab would (eos, im_end, bos, think controls); ignore_eos must
+ * suppress the eos stop ONLY, never im_end/bos or the thinking controls. */
+static void check_stop_decode_truth_table(void) {
+    const int EOS = 100, IM_END = 101, BOS = 102, TS = 103, TE = 104,
+              WORD = 55;
+    ds4_engine *e = ds4_test_engine_with_stop_ids(EOS, IM_END, BOS, TS, TE);
+    /* The generation-stop set is variant-dependent; im_end/bos only count
+     * under the qwen4exp variant this model is. */
+    const int saved_variant = ds4_test_set_variant_qwen4exp();
+    CHECK(e != NULL, "fake engine allocation");
+    if (!e) { ds4_test_restore_variant(saved_variant); return; }
+    /* EOS: stops normally, ignored under ignore_eos. */
+    CHECK(ds4_token_stops_decode(e, EOS, DS4_THINK_NONE, false),
+          "eos stops decode");
+    CHECK(!ds4_token_stops_decode(e, EOS, DS4_THINK_NONE, true),
+          "ignore_eos suppresses eos");
+    CHECK(ds4_token_stops_decode(e, EOS, DS4_THINK_HIGH, false),
+          "eos stops in thinking mode");
+    CHECK(!ds4_token_stops_decode(e, EOS, DS4_THINK_HIGH, true),
+          "ignore_eos suppresses eos while thinking");
+    /* Other generation stops are never suppressed. */
+    CHECK(ds4_token_stops_decode(e, IM_END, DS4_THINK_NONE, true),
+          "ignore_eos cannot suppress im_end");
+    CHECK(ds4_token_stops_decode(e, BOS, DS4_THINK_NONE, true),
+          "ignore_eos cannot suppress bos");
+    CHECK(ds4_token_stops_decode(e, IM_END, DS4_THINK_HIGH, true),
+          "ignore_eos cannot suppress im_end while thinking");
+    /* Thinking controls stop only when thinking is disabled, even under
+     * ignore_eos. */
+    CHECK(ds4_token_stops_decode(e, TS, DS4_THINK_NONE, true),
+          "think-start stops no-thinking decode under ignore_eos");
+    CHECK(ds4_token_stops_decode(e, TE, DS4_THINK_NONE, true),
+          "think-end stops no-thinking decode under ignore_eos");
+    CHECK(!ds4_token_stops_decode(e, TS, DS4_THINK_HIGH, false),
+          "think-start is content while thinking");
+    CHECK(!ds4_token_stops_decode(e, TE, DS4_THINK_HIGH, false),
+          "think-end is content while thinking");
+    /* Ordinary tokens never stop. */
+    CHECK(!ds4_token_stops_decode(e, WORD, DS4_THINK_NONE, false),
+          "ordinary token flows");
+    CHECK(!ds4_token_stops_decode(e, WORD, DS4_THINK_NONE, true),
+          "ordinary token flows under ignore_eos");
+    ds4_test_engine_free(e);
+    ds4_test_restore_variant(saved_variant);
+}
+
 int main(void) {
     check_speculative_distribution();
     check_point_sample_distribution();
     check_point_sample_chained();
+    check_stop_decode_truth_table();
     const uint32_t semantic_n = 4096;
     float *logits = malloc((size_t)semantic_n * sizeof(*logits));
     float *scratch = malloc((size_t)semantic_n * sizeof(*scratch));

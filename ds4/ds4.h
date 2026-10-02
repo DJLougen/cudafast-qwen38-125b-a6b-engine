@@ -382,6 +382,12 @@ bool ds4_token_is_thinking_control(ds4_engine *e, int token);
 bool ds4_token_is_stop_for_think_mode(ds4_engine *e,
                                       int token,
                                       ds4_think_mode mode);
+/* The one decode-stop decision, shared by every boundary that tests a picked
+ * or committed token.  `ignore_eos` suppresses ONLY the eos_id stop; every
+ * other generation stop (im_end, bos, family markers) and the no-thinking
+ * mode's thinking-control stop still apply. */
+bool ds4_token_stops_decode(ds4_engine *e, int token,
+                            ds4_think_mode mode, bool ignore_eos);
 int ds4_token_user(ds4_engine *e);
 int ds4_token_assistant(ds4_engine *e);
 
@@ -492,6 +498,15 @@ int ds4_test_speculative_point_sample(const float *target_logits,
 int ds4_test_argmax_excluding_logits(const float *logits, uint32_t n_vocab,
                                      int excluded_id);
 uint64_t ds4_test_mixed_native_count(void);
+/* A fabricated engine carrying only the stop-token vocabulary, so
+ * ds4_token_stops_decode's truth table is testable without a model. */
+ds4_engine *ds4_test_engine_with_stop_ids(int eos, int im_end, int bos,
+                                          int think_start, int think_end);
+void ds4_test_engine_free(ds4_engine *e);
+/* Switch DS4_MODEL_VARIANT to qwen4exp for stop-set tests; returns the prior
+ * variant for ds4_test_restore_variant.  The variant enum is ds4.c-private. */
+int ds4_test_set_variant_qwen4exp(void);
+void ds4_test_restore_variant(int variant);
 #endif
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);

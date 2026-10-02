@@ -142,3 +142,31 @@ void ds4s_spec_counters(const ds4s_handle *h, uint64_t *drafts, uint64_t *hits,
      * A fixed 0 keeps the wire field exercised end to end. */
     if (disagreements) *disagreements = 0;
 }
+
+/* The sampled siblings: the stub has no distribution to draw from, so it
+ * folds the RNG stream into a token deterministically -- enough for wire and
+ * seed-parse tests, which only need a bounded non-negative id. */
+int32_t ds4s_sample(ds4s_handle *h, float temperature, int top_k,
+                    float top_p, float min_p, uint64_t *rng) {
+    (void)temperature; (void)top_k; (void)top_p; (void)min_p;
+    if (!h || !rng) return -1;
+    *rng = *rng * 6364136223846793005ull + 1442695040888963407ull;
+    return (int32_t)(*rng % (uint64_t)STUB_VOCAB);
+}
+
+int ds4s_eval_speculative_sampled(ds4s_handle *h, int32_t first_token,
+                                  int budget, float temperature, int top_k,
+                                  float top_p, float min_p, uint64_t *rng,
+                                  int32_t *out, int cap) {
+    (void)temperature; (void)top_k; (void)top_p; (void)min_p;
+    if (!h || !out || !rng || cap <= 0 || budget <= 0) return -1;
+    /* The sampled twin of the armed-draft leg: the fed token, then one extra
+     * when the cycle "accepts" so both commit sizes cross the wire. */
+    int n = ds4s_eval_speculative(h, first_token, budget, out, cap);
+    if (n < 0) return n;
+    if (budget > n && cap > n) {
+        out[n] = ds4s_sample(h, 1.0f, 0, 1.0f, 0.0f, rng);
+        if (out[n] >= 0) n++;
+    }
+    return n;
+}
