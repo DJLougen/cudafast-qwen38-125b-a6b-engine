@@ -66175,6 +66175,11 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
          * ds4_session_top_logits read it, unchanged, the way every family
          * does. */
         qs->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(qs->logits[0]));
+        /* The sampled speculative cycle's probability scratch: this family
+         * allocates it here (the resident's constructor) the same way the
+         * HTTP session paths do, so spec_cycle_sampled never sees NULL. */
+        qs->sample_probs =
+            xmalloc((size_t)DS4_N_VOCAB * sizeof(qs->sample_probs[0]));
         qs->qwen4exp = true;
         *out = qs;
         return 0;
