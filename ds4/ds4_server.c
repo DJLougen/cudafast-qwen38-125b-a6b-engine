@@ -13081,6 +13081,11 @@ decode_again:
     dsml_decode_tracker_init(&dsml_tracker);
 
     server_generation_enter(s);
+
+    /* Set when any speculative batch was cut before all committed tokens were
+     * consumed; live-state publishers refuse it so a later request never
+     * resumes from tokens the client did not see. */
+    bool batch_cut_early = false;
     while (!g_stop_requested && !job_cancelled(j) && completion < max_tokens &&
            ds4_session_pos(slot->session) < ds4_session_ctx(slot->session)) {
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
@@ -13121,10 +13126,13 @@ decode_again:
             snprintf(err, sizeof(err), "failed to select a non-EOS token");
             break;
         }
-        if (!j->req.ignore_eos &&
-            ds4_token_is_stop_for_think_mode(s->engine,
-                                             token,
-                                             j->req.think_mode)) {
+        /* ignore_eos suppresses ONLY the EOS stop.  Thinking-control tokens
+         * (think start/end markers that no-thinking mode treats as stops)
+         * still terminate the decode, selected or committed. */
+        if ((!j->req.ignore_eos &&
+             ds4_token_is_stop(s->engine, token)) ||
+            (!ds4_think_mode_enabled(j->req.think_mode) &&
+             ds4_token_is_thinking_control(s->engine, token))) {
             finish = "stop";
             break;
         }
@@ -13134,8 +13142,8 @@ decode_again:
         /* qwen4exp MTP: greedy commits the target's argmax (bit-identical to
          * serial) and sampled requests take the exact point-mass cycle in
          * ds4_session_eval_speculative.  DS4_QWEN4EXP_NO_SPEC_SAMPLING is the
-         * kill switch restoring serial sampled decode; ignore_eos requests
-         * are greedy regardless of temperature. */
+         * kill switch restoring serial sampled decode; ignore_eos with
+         * temperature 0 takes the argmax-ignoring-eos pick. */
         const bool spec_greedy_only =
             ds4_engine_is_qwen4exp(s->engine) &&
             getenv("DS4_QWEN4EXP_NO_SPEC_SAMPLING") != NULL;
@@ -13171,18 +13179,24 @@ decode_again:
         }
 
         bool stop_decode = false;
-        for (int ti = 0; ti < ntok && completion < max_tokens; ti++) {
+        /* A speculative batch commits its tokens even when the consumer stops
+         * partway (EOS, stop list, tool close, cancel): everything after the
+         * cut is still in the session and in the retained frontier.  ti is
+         * hoisted so an early exit is visible after the loop. */
+        int ti = 0;
+        for (; ti < ntok && completion < max_tokens; ti++) {
             if (job_cancelled(j)) {
                 stop_decode = true;
                 break;
             }
             token = toks[ti];
-            /* ignore_eos: EOS is an ordinary token now -- sampled requests can
-             * land on it, and it is committed and emitted like any other. */
-            if (!j->req.ignore_eos &&
-                ds4_token_is_stop_for_think_mode(s->engine,
-                                                 token,
-                                                 j->req.think_mode)) {
+            /* Same split as the selection boundary: ignore_eos drops the EOS
+             * stop only; a committed batch's thinking-control tokens still
+             * stop the decode. */
+            if ((!j->req.ignore_eos &&
+                 ds4_token_is_stop(s->engine, token)) ||
+                (!ds4_think_mode_enabled(j->req.think_mode) &&
+                 ds4_token_is_thinking_control(s->engine, token))) {
                 finish = "stop";
                 stop_decode = true;
                 break;
@@ -13360,6 +13374,18 @@ decode_again:
                 stop_decode = true;
                 break;
             }
+        }
+        /* The batch committed tokens the response never consumed.  The
+         * session tail and the retained live frontier both describe text the
+         * client never saw, so remembering that frontier would make a later
+         * request replay an invisible suffix.  Invalidate the session and
+         * mark the cut; the live-state publishers below refuse to remember a
+         * frontier built on unseen tokens. */
+        if (ti < ntok) {
+            pthread_mutex_lock(&s->inference_mu);
+            ds4_session_invalidate(slot->session);
+            pthread_mutex_unlock(&s->inference_mu);
+            batch_cut_early = true;
         }
         if (stop_decode) break;
     }
@@ -13639,8 +13665,13 @@ decode_again:
                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                  parsed_reasoning, &parsed_calls, now_sec() - t0);
 
+    /* A batch cut early means the session's tail contains committed tokens
+     * that never reached the response; every live-state publisher treats that
+     * turn as unrememberable so the next request re-prefills the visible
+     * prompt instead of resuming from unseen tokens. */
     if (j->req.api == API_RESPONSES) {
-        if (strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
+        if (!batch_cut_early &&
+            strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
             /* Store the post-turn visible transcript plus the live token
              * frontier.  The next Responses request may replay only this
              * visible surface, while the real session also contains hidden
@@ -13662,7 +13693,8 @@ decode_again:
         }
     }
     if (j->req.api == API_ANTHROPIC) {
-        if (parsed_calls.len && strcmp(final_finish, "error") &&
+        if (!batch_cut_early && parsed_calls.len &&
+            strcmp(final_finish, "error") &&
             strcmp(final_finish, "length"))
         {
             anthropic_live_remember(s, slot, &parsed_calls);
@@ -13680,14 +13712,18 @@ decode_again:
          * path where we lack exact sampled DSML replay; when raw DSML is known,
          * replaying those bytes keeps future prompts aligned without rebuilding
          * hidden reasoning.  Responses deliberately skips this path because its
-         * previous_response_id contract binds the next turn to live state. */
-        canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
-                                     parsed_content ? parsed_content : "",
-                                     parsed_reasoning, &parsed_calls);
+         * previous_response_id contract binds the next turn to live state.
+         * After an early batch cut the session is already invalidated, so the
+         * checkpoint work must not run against the poisoned tail. */
+        if (!batch_cut_early) {
+            canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
+                                         parsed_content ? parsed_content : "",
+                                         parsed_reasoning, &parsed_calls);
+        }
         thinking_live_clear(s, slot);
     } else if (parsed_calls.len) {
         thinking_live_clear(s, slot);
-    } else if (!parsed_calls.len &&
+    } else if (!batch_cut_early && !parsed_calls.len &&
                should_remember_thinking_checkpoint(&j->req, &thinking, final_finish)) {
         remember_thinking_checkpoint(s, slot, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "");

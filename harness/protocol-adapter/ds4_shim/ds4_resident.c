@@ -180,6 +180,26 @@ static int field_int(const char *line, const char *key, long long *out) {
     return 0;
 }
 
+/* Read the UNSIGNED integer value of `key` with full range and format
+ * checking: strtoull with ERANGE, trailing garbage and a leading '-' all
+ * fail.  field_int saturates at LLONG_MAX and ignores junk; seeds are uint64
+ * and values above LLONG_MAX are legitimate, so they must not go through it.
+ * Returns 0 on success. */
+static int field_u64(const char *line, const char *key, uint64_t *out) {
+    const char *at = field(line, key);
+    if (!at) return -1;
+    while (*at == ' ' || *at == '\t') at++;
+    if (*at == '-') return -1;
+    char *end = NULL;
+    errno = 0;
+    const unsigned long long v = strtoull(at, &end, 10);
+    if (end == at || errno == ERANGE) return -1;
+    if (*end != ',' && *end != '}' && *end != ']' &&
+        *end != ' ' && *end != '\t' && *end != '\0') return -1;
+    *out = (uint64_t)v;
+    return 0;
+}
+
 /* Read the integer array value of `key` into a freshly allocated buffer.
  * Returns the count, or -1. `*out` is set only on success (it may be NULL for
  * an empty array). */
@@ -460,13 +480,14 @@ static int serve_line(const resident *r, int fd, const char *line) {
          * the round left.  Required fields: count, seed; optional temperature
          * (default 1.0), top_k, top_p, min_p, first_token (sampled when
          * absent). */
-        long long count = 0, seed = 0, first = 0, top_k = 0;
+        long long count = 0, first = 0, top_k = 0;
+        uint64_t seed = 0;
         if (field_int(line, "count", &count) != 0 ||
             count <= 0 || count > RESIDENT_MAX_RUN ||
-            field_int(line, "seed", &seed) != 0) {
+            field_u64(line, "seed", &seed) != 0) {
             free(out.data);
             return send_error(fd, "spec_run_sampled needs a \"count\" in "
-                                  "1..65536 and a \"seed\"") ? 1 : -1;
+                                  "1..65536 and an unsigned \"seed\"") ? 1 : -1;
         }
         double temperature = 1.0, top_p = 1.0, min_p = 0.0;
         {   const char *at;
@@ -475,7 +496,7 @@ static int serve_line(const resident *r, int fd, const char *line) {
             if ((at = field(line, "min_p")))       min_p = strtod(at, NULL);
         }
         if (field_int(line, "top_k", &top_k) != 0) top_k = 0;
-        uint64_t rng = (uint64_t)seed;
+        uint64_t rng = seed;
         int32_t pending;
         if (field_int(line, "first_token", &first) == 0) {
             pending = (int32_t)first;

@@ -421,7 +421,7 @@ static void check_point_sample_distribution(void) {
            ">=1e6 draws per case\n");
     /* Drafts with large, middling and tiny mass; truncation cases exercise
      * top_k, top_p and min_p through the production probability builder. */
-    static const float flat[] = {
+    const float flat[] = {
         logf(0.30f), logf(0.25f), logf(0.20f), logf(0.15f), logf(0.10f),
     };
     check_point_sample_case("flat draft=pmax", flat, 5, 0,
@@ -448,10 +448,10 @@ static void check_point_sample_distribution(void) {
  * where the second position is never evaluated on reject -- and chi-square
  * the observed (row, token) pairs over >=1e6 rounds. */
 static void check_point_sample_chained(void) {
-    static const float logits0[] = {
+    const float logits0[] = {
         logf(0.40f), logf(0.30f), logf(0.20f), logf(0.10f),
     };
-    static const float logits1[] = {
+    const float logits1[] = {
         logf(0.10f), logf(0.20f), logf(0.30f), logf(0.40f),
     };
     enum { N = 4, D0 = 1, D1 = 2, DRAWS = 1500000 };
