@@ -53,12 +53,37 @@ static uint32_t mm_threads(uint32_t value) {
     while (nth * 2u <= value && nth * 2u <= 1024u) nth *= 2;
     return nth;
 }
-static __device__ float mm_blk_sum(float *shared, uint32_t tid,
+/* Sum shared[0 .. nth) into shared[0]; `nth` must be a power of two.
+ * The writer guard is tid < step, not tid + step < nth: under the latter,
+ * threads in [step, nth - step) overwrite cells threads [0, step) are
+ * still reading inside the same phase, racing the sum (the mm-path logits
+ * drifted run to run because of exactly this).  The tail is the text
+ * path's warp shuffle, so a row's norm is bit-for-bit the one
+ * qwen4exp_blk_sum computes. */
+static __device__ __forceinline__ float mm_blk_sum(float *shared, uint32_t tid,
                                    uint32_t nth) {
-    for (uint32_t s = nth >> 1; s > 0; s >>= 1) {
-        if (tid + s < nth) shared[tid] += shared[tid + s];
+    if (nth < 32u) {
+        for (uint32_t step = nth >> 1; step > 0u; step >>= 1) {
+            __syncthreads();
+            if (tid < step) shared[tid] += shared[tid + step];
+        }
         __syncthreads();
+        return shared[0];
     }
+    for (uint32_t step = nth >> 1; step >= 32u; step >>= 1) {
+        __syncthreads();
+        if (tid < step) shared[tid] += shared[tid + step];
+    }
+    __syncthreads();
+    if (tid < 32u) {
+        float v = shared[tid];
+#pragma unroll
+        for (uint32_t step = 16u; step > 0u; step >>= 1) {
+            v += __shfl_down_sync(0xffffffffu, v, step);
+        }
+        if (tid == 0u) shared[0] = v;
+    }
+    __syncthreads();
     return shared[0];
 }
 /* M-RoPE axis + angle for pair index d of a row. */

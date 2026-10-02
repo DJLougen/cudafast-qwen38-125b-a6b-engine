@@ -1894,6 +1894,102 @@ static bool qwen4exp_graph_gdn_block(ds4_qwen4exp_session *s,
     return true;
 }
 
+/* Determinism bisect hook (DS4_QWEN4EXP_MM_HASH=1): read back a device
+ * tensor, FNV-1a it, and print stage/hash to stderr.  With
+ * DS4_QWEN4EXP_MM_DIFF=1 it also keeps the first call's buffer per tag at
+ * layer 3 and prints element diffs against later calls.  Read-back forces a
+ * sync, so it is for debugging only. */
+static int qw_mm_hash_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("DS4_QWEN4EXP_MM_HASH");
+        on = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return on;
+}
+static int qw_mm_diff_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("DS4_QWEN4EXP_MM_DIFF");
+        on = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return on;
+}
+struct qw_mm_ref { char tag[8]; unsigned char *buf; uint64_t bytes; int seen; };
+static struct qw_mm_ref g_qw_mm_refs[64];
+static void qw_mm_hash(const char *tag, uint32_t il,
+                       const ds4_gpu_tensor *t, uint64_t off_bytes,
+                       uint64_t bytes) {
+    if (!qw_mm_hash_on() || !t || !t->ptr || !bytes) return;
+    (void)ds4_gpu_end_commands();
+    (void)ds4_gpu_synchronize();
+    unsigned char *buf = (unsigned char *)malloc((size_t)bytes);
+    if (buf && ds4_gpu_tensor_read(t, off_bytes, buf, bytes)) {
+        uint64_t h = 1469598103934665603ull;
+        for (uint64_t i = 0; i < bytes; i++) {
+            h ^= buf[i];
+            h *= 1099511628211ull;
+        }
+        fprintf(stderr, "MMHASH %s L%02x off=%llu n=%llu fnv=%016llx\n",
+                tag, il, (unsigned long long)off_bytes,
+                (unsigned long long)bytes, (unsigned long long)h);
+        if (qw_mm_diff_on() && il == 3) {
+            struct qw_mm_ref *r = NULL;
+            for (int i = 0; i < 64; i++) {
+                if (g_qw_mm_refs[i].seen &&
+                    strcmp(g_qw_mm_refs[i].tag, tag) == 0) {
+                    r = &g_qw_mm_refs[i]; break;
+                }
+                if (!g_qw_mm_refs[i].seen && !r) r = &g_qw_mm_refs[i];
+            }
+            if (r && !r->seen) {
+                snprintf(r->tag, sizeof(r->tag), "%s", tag);
+                r->buf = (unsigned char *)malloc((size_t)bytes);
+                if (r->buf) memcpy(r->buf, buf, (size_t)bytes);
+                r->bytes = bytes;
+                r->seen = 1;
+            } else if (r && r->seen && r->buf && r->bytes == bytes &&
+                       memcmp(r->buf, buf, (size_t)bytes) != 0) {
+                const float *a = (const float *)r->buf;
+                const float *b = (const float *)buf;
+                uint64_t nd = 0, first = ~0ull;
+                uint64_t chan_min = ~0ull, chan_max = 0;
+                double min_ratio = 1e30, max_ratio = -1e30;
+                for (uint64_t i = 0; i < bytes / 4u; i++) {
+                    if (memcmp(&a[i], &b[i], 4) != 0) {
+                        if (!nd) first = i;
+                        nd++;
+                        const uint64_t ch = i % 256u;
+                        if (ch < chan_min) chan_min = ch;
+                        if (ch > chan_max) chan_max = ch;
+                        if (a[i] != 0.0f) {
+                            double rt = (double)b[i] / (double)a[i];
+                            if (rt < min_ratio) min_ratio = rt;
+                            if (rt > max_ratio) max_ratio = rt;
+                        }
+                        if (nd <= 8)
+                            fprintf(stderr,
+                                    "MMDIFF %s e=%llu a=%.9g b=%.9g\n",
+                                    tag, (unsigned long long)i,
+                                    (double)a[i], (double)b[i]);
+                    }
+                }
+                fprintf(stderr, "MMDIFF %s ndiff=%llu first=%llu "
+                        "(row=%llu chan=%llu) chan=[%llu,%llu] "
+                        "ratio=[%.6f,%.6f]\n", tag,
+                        (unsigned long long)nd, (unsigned long long)first,
+                        (unsigned long long)(first / 256u),
+                        (unsigned long long)(first % 256u),
+                        (unsigned long long)chan_min,
+                        (unsigned long long)chan_max,
+                        min_ratio, max_ratio);
+            }
+        }
+    }
+    free(buf);
+    (void)ds4_gpu_begin_commands();
+}
+
 static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
                                      const ds4_qwen4exp_layer_weights *l,
                                      const ds4_model *m,
@@ -1907,6 +2003,10 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
     const uint32_t max_selected = DS4_QWEN4EXP_MAX_SELECTED(top_k, ratio);
     const uint32_t n_blocks = s->plan.n_ctx / ratio;
     const uint32_t pos0 = s->pos;
+    if (s->mm)
+        qw_mm_hash("mixed", il, s->mixed, 0,
+                   (uint64_t)n_tokens * DS4_N_EMBD * 4u);
+
 
     /* Pre-quantize s->mixed ONCE for Q, K, and V projections. */
     const uint64_t q8_blocks = (uint64_t)DS4_N_EMBD / 32u;
@@ -2019,6 +2119,27 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
         }
 
     }
+        if (s->mm) {
+            const uint64_t kv_w_i = (uint64_t)DS4_N_HEAD_KV * head_dim;
+            qw_mm_hash("dbl", il, s->qsa_doubled, 0,
+                       2ull * n_tokens * DS4_N_HEAD * head_dim * 4u);
+            qw_mm_hash("kin", il, s->qsa_kin, 0,
+                       (uint64_t)n_tokens * kv_w_i * 4u);
+            qw_mm_hash("rpos", il, s->mm->d_row_pos, 0,
+                       (uint64_t)n_tokens * 16u);
+            qw_mm_hash("dpos", il, s->d_pos, 0, 4u);
+            const uint64_t kv_w = (uint64_t)DS4_N_HEAD_KV * head_dim;
+            qw_mm_hash("q", il, s->qsa_q, 0,
+                       (uint64_t)n_tokens * DS4_N_HEAD * head_dim * 4u);
+            qw_mm_hash("k", il, s->qsa_k[il],
+                       (uint64_t)s->mm->n_rows * kv_w * 4u,
+                       (uint64_t)n_tokens * kv_w * 4u);
+            qw_mm_hash("v", il, s->qsa_v[il],
+                       (uint64_t)s->mm->n_rows * kv_w * 4u,
+                       (uint64_t)n_tokens * kv_w * 4u);
+        }
+
+
 
     /* Indexer: BF16 projections, the exact unrotated key tape, pooled blocks,
      * block scores, top-k, and the "keep OR own" expansion.
@@ -2061,6 +2182,11 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
                     "ds4: qwen4exp mm pool update failed at block %u\n", il);
             return false;
         }
+        qw_mm_hash("pool", il, s->idx_pool[il], 0,
+                   (uint64_t)n_blocks * DS4_N_INDEXER_HEAD_DIM * 4u);
+        qw_mm_hash("tape", il, s->idx_tape[il],
+                   (uint64_t)s->mm->n_rows * DS4_N_INDEXER_HEAD_DIM * 4u,
+                   (uint64_t)n_tokens * DS4_N_INDEXER_HEAD_DIM * 4u);
     } else if (!ds4_gpu_qwen4exp_qsa_indexer_pool_update_dpos_tensor(
             s->idx_pool[il], s->idx_tape[il], s->idx_k, s->idx_k_norm[il],
             s->inv_freq, pos0, n_tokens, s->plan.n_ctx,
@@ -2118,6 +2244,14 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
                         il);
                 return false;
             }
+            qw_mm_hash("scores", il, s->idx_scores, 0,
+                       (uint64_t)n_tokens * mm_blocks * 4u);
+            qw_mm_hash("topk", il, s->idx_topk, 0,
+                       (uint64_t)n_tokens * tk_eff * 4u);
+            qw_mm_hash("sel", il, s->idx_selected, 0,
+                       (uint64_t)n_tokens * max_selected * 4u);
+            qw_mm_hash("cnt", il, s->idx_counts, 0,
+                       (uint64_t)n_tokens * 4u);
         } else if (!ds4_gpu_qwen4exp_rope_head_tensor(s->idx_q, s->inv_freq, n_tokens,
                                                DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM,
                                                DS4_N_ROT, pos0) ||
@@ -2148,6 +2282,10 @@ static bool qwen4exp_graph_qsa_block(ds4_qwen4exp_session *s,
         fprintf(stderr, "ds4: qwen4exp QSA attention failed at block %u\n", il);
         return false;
     }
+    if (s->mm)
+        qw_mm_hash("attn", il, s->qsa_out, 0,
+                   (uint64_t)n_tokens * DS4_N_HEAD * head_dim * 4u);
+
 
     /* At prefill width the gate writes the Q8_0 the attn_output projection
      * reads (into the session's 6144-wide scratch, which the GDN output also
@@ -3506,6 +3644,9 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         fprintf(stderr, "ds4: qwen4exp mm embedding splice failed\n");
         return qwen4exp_forward_fail();
     }
+    if (s->mm_pending && s->mm)
+        qw_mm_hash("hyper", 0, s->hyper, 0,
+                   (uint64_t)n_tokens * DS4_N_HC * DS4_N_EMBD * 4u);
     QW_TRACE(QW_SLICE_EMBED);
 
     if (!qwen4exp_graph_layers(s, w, m, n_tokens)) {
@@ -3613,6 +3754,9 @@ bool ds4_qwen4exp_graph_forward(ds4_qwen4exp_session       *s,
         fprintf(stderr, "ds4: qwen4exp LM head failed\n");
         return qwen4exp_forward_fail();
     }
+    if (s->mm)
+        qw_mm_hash("logits", 0xff, s->logits, 0,
+                   (uint64_t)logit_rows * cfg->n_vocab * 4u);
     if (s->spec_top1_rows != 0u &&
         (s->spec_top1_rows != logit_rows ||
          !ds4_gpu_indexer_topk_tensor(s->spec_top1, s->logits,

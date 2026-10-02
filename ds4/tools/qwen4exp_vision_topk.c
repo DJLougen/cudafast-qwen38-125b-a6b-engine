@@ -92,6 +92,27 @@ int main(int argc, char **argv) {
     char *tt = ds4_token_text(e, top, &tlen);
     printf("argmax=%d text=\"%.*s\"\n", top, tt ? (int)tlen : 0, tt ? tt : "");
     if (tt) free(tt);
+    /* Full first-token logits fingerprint: FNV-1a over the f32 logits the
+     * model just produced. */
+    {
+        static float *lg = NULL;
+        static int lg_cap = 0;
+        const int nv = ds4_engine_vocab_size(e);
+        if (nv > lg_cap) {
+            free(lg);
+            lg = malloc((size_t)nv * sizeof(float));
+            lg_cap = nv;
+        }
+        if (lg && ds4_session_copy_logits(s, lg, nv) == nv) {
+            const unsigned char *p = (const unsigned char *)lg;
+            uint64_t h = 1469598103934665603ull;
+            for (uint64_t i = 0; i < (uint64_t)nv * 4u; i++) {
+                h ^= p[i];
+                h *= 1099511628211ull;
+            }
+            printf("logits_fnv=%016llx\n", (unsigned long long)h);
+        }
+    }
     ds4_token_score scores[8];
     const int k = ds4_session_top_logprobs(s, scores, 8);
     for (int i = 0; i < k; i++) {
@@ -101,6 +122,27 @@ int main(int argc, char **argv) {
                scores[i].logit, scores[i].logprob,
                txt ? (int)len : 0, txt ? txt : "");
         if (txt) free(txt);
+    }
+    /* --gen N: greedy-argmax N tokens and hash the id stream. */
+    {
+        const char *ge = getenv("DS4V_GEN");
+        const int gen = ge ? atoi(ge) : 0;
+        if (gen > 0) {
+            uint64_t h = 1469598103934665603ull;
+            int cur = top;
+            for (int i = 0; i < gen; i++) {
+                const uint32_t id = (uint32_t)cur;
+                h ^= id;
+                h *= 1099511628211ull;
+                printf("gen[%d]=%d\n", i, cur);
+                if (ds4_session_eval(s, cur, err, sizeof(err)) != 0) {
+                    fprintf(stderr, "eval: %s\n", err);
+                    return 1;
+                }
+                cur = ds4_session_argmax(s);
+            }
+            printf("gen_fnv=%016llx\n", (unsigned long long)h);
+        }
     }
     ds4_session_free(s);
     }
