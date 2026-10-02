@@ -14728,8 +14728,16 @@ done:
 }
 
 static int listen_on(const char *host, int port) {
+    /* SOCK_CLOEXEC where the OS has it (Linux); the fcntl below covers macOS
+     * and is harmless redundancy elsewhere.  Without CLOEXEC the lazily
+     * spawned vision daemon inherits this socket and holds it open. */
+#ifdef SOCK_CLOEXEC
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+#else
     int fd = socket(AF_INET, SOCK_STREAM, 0);
+#endif
     if (fd < 0) return -1;
+    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
     int yes = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
@@ -15414,7 +15422,14 @@ int main(int argc, char **argv) {
     server_log(DS4_LOG_DEFAULT, "ds4-server: listening on http://%s:%d", cfg.host, cfg.port);
 
     while (!g_stop_requested) {
+        /* accept4(..., SOCK_CLOEXEC) closes the accept->fork() race window;
+         * the fcntl fallback covers platforms without accept4. */
+#if defined(__linux__)
+        int fd = accept4(lfd, NULL, NULL, SOCK_CLOEXEC);
+#else
         int fd = accept(lfd, NULL, NULL);
+        if (fd >= 0) (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+#endif
         if (fd < 0) {
             if (g_stop_requested) break;
             if (errno == EINTR) continue;
