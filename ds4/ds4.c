@@ -77015,11 +77015,19 @@ static int ds4_session_qwen4exp_spec_cycle_sampled(
         char *err, size_t errlen) {
     ds4_engine *e = s->engine;
     if (!ds4_session_qwen4exp_spec_init(s, err, errlen)) return -1;
+    /* Every qwen4exp session path must reach this scratch, so the wrapper
+     * allocates it lazily on first use rather than trusting each session
+     * constructor to have done it (the resident's constructor already does;
+     * HTTP/CLI paths may not).  Failure here is OOM, not "no scratch". */
     if (!s->sample_probs) {
-        snprintf(err, errlen,
-                 "qwen4exp MTP: sampled cycle needs the session's probability "
-                 "scratch");
-        return -1;
+        s->sample_probs =
+            malloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
+        if (!s->sample_probs) {
+            snprintf(err, errlen,
+                     "qwen4exp MTP: out of memory allocating the sampled "
+                     "cycle's probability scratch");
+            return -1;
+        }
     }
     if (s->qwen4exp_seam.n_vocab != (uint32_t)DS4_N_VOCAB) {
         snprintf(err, errlen,
