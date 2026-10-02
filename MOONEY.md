@@ -19,10 +19,12 @@ Our delta adds what Mooney's GGUF needs:
   (`--mtp-model` / `--mtp-draft`);
 - ChatML/qwen4exp serving fixes and GB10 (sm_121) build fixes.
 
-Measured on a DGX Spark: **45.8 tok/s** decode short-context and **47.7 tok/s**
-at 4k with the MTP head (draft depth 1); 33.3 / 30.6 tok/s serial — 1.39×/1.43×
-faster than the 4-bit UD-Q4_K_XL build on this same engine. See the model card
-for the full numbers and quality evaluation.
+Measured on a DGX Spark (engine c9e0679f, greedy, 128-token runs): **50.7 tok/s**
+decode at short context and **46.4 tok/s** at 4k with the MTP head
+(`--mtp-draft 3`), 40.5 tok/s at 256k; 31.5 / 27.8 tok/s without MTP. Greedy MTP
+output is token-identical to MTP-off. MTP only speeds up greedy requests;
+sampled requests decode without it. See the model card for the full numbers
+and quality evaluation.
 
 ## Easiest path: one-command setup
 
@@ -51,13 +53,13 @@ Run:
 ds4/ds4-server \
   -m Qwen3.8-Flash-Next-Mooney-PQ2_0-00001-of-00004.gguf \
   --vision mmproj-Qwen3.8-Flash-Next-Mooney.gguf \
-  --mtp-model mtp-Qwen3.8-Flash-Next.gguf --mtp-draft 2 \
+  --mtp-model mtp-Qwen3.8-Flash-Next.gguf --mtp-draft 3 \
   --cuda --ctx 32768 --host 127.0.0.1 --port 8000
 ```
 
-(`--mtp-draft 2` = draft depth 1. Text only for now — image input support is in
-progress; the [prism-llama.cpp](https://github.com/DJLougen/prism-llama.cpp)
-fork serves images today.)
+(`--mtp-draft 3` = draft depth 2; `--mtp-draft 2` = depth 1. Image input needs
+the `tools/qwen4exp-vision-encode` helper, which the mooney-spark setup script
+builds; MTP turns itself off for image requests.)
 
 ## Credits and license
 
