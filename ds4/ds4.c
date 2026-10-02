@@ -68141,7 +68141,7 @@ static int ds4_session_qwen4exp_rows(ds4_session *s, const int *tokens,
      * disabled for image-conditioned sessions: the head cache publishes by
      * position, and mrope t is not the slot index, so a drafted round would
      * write keyed-by-t rows over slot-keyed state. */
-    if (qs->mm) {
+    if (qs->mm && qs->mm_armed) {
         if (e->qwen4exp_mtp_ready && !s->mm_mtp_logged) {
             s->mm_mtp_logged = 1;
             fprintf(stderr,
@@ -68259,6 +68259,26 @@ static int ds4_session_qwen4exp_sync(ds4_session *s, const ds4_tokens *prompt,
     /* Reset the caches AND the tape together: the sync replays the whole
      * prompt from position 0, so a tape left behind would describe a prefix
      * the caches no longer hold. */
+    /* Arm or disarm the multimodal arm for THIS request, before the reset
+     * runs.  Once a prompt has carried image spans the mm state exists for the
+     * life of the engine session; a bare `if (s->mm)` below routes every later
+     * TEXT request through the mm kernels -- a different arithmetic -- and
+     * decode-graph islands captured under one arming replay under the other
+     * (the captured kernels bake the mm row-pos/cell-map device pointers),
+     * which both contaminates text requests after an image and faulted when
+     * the parent's attempt freed the buffers a live graph replayed.  So: keep
+     * mm allocated, flip the flag on every sync, and drop the decode-graph
+     * table whenever the arming changes so a replay can never cross it. */
+    if (e->qwen4exp_session) {
+        const int arm = s->sync_image_count ? 1 : 0;
+        if (e->qwen4exp_session->mm && arm &&
+            !e->qwen4exp_session->mm_armed)
+            ds4_qwen4exp_mm_reset(e->qwen4exp_session->mm);
+        if (e->qwen4exp_session->mm_armed != arm) {
+            e->qwen4exp_session->mm_armed = arm;
+            ds4_gpu_decode_graphs_invalidate();
+        }
+    }
     ds4_qwen4exp_session_reset(e->qwen4exp_session);
     /* A sync is a new prefix, so any carried draft is for a position that no
      * longer exists.  See ds4_session_invalidate. */
@@ -76969,7 +76989,12 @@ static bool ds4_session_qwen4exp_spec(const ds4_session *s) {
     (void)s;
     return false;
 #else
-    return ds4_session_is_qwen4exp(s) && s->engine->qwen4exp_mtp_ready;
+    /* The mrope t cursor is not the slot index the head cache publishes
+     * by, and the seam's verify runs straight into the graph without the
+     * rows() planner -- image-conditioned sessions take the serial step. */
+    return ds4_session_is_qwen4exp(s) && s->engine->qwen4exp_mtp_ready &&
+           !(s->engine->qwen4exp_session &&
+             s->engine->qwen4exp_session->mm_armed);
 #endif
 }
 
@@ -78647,6 +78672,19 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                err, errlen);
     }
 #endif
+#ifndef DS4_NO_GPU
+    if (s && s->engine && s->engine->qwen4exp_session &&
+        s->engine->qwen4exp_session->mm_armed) {
+        /* Image-conditioned session: the MTP cycle is off (the seam's verify
+         * bypasses the rows() planner, and the head cache publishes by slot
+         * position, not mrope t).  Commit the fed token with one serial step
+         * instead of falling through to a non-qwen4exp impl. */
+        if (!accepted || accepted_cap <= 0 || max_tokens <= 0) return 0;
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
+    }
+#endif
     return ds4_session_eval_speculative_argmax_impl(
         s, first_token, max_tokens, eos_token, false, DS4_THINK_HIGH,
         accepted, accepted_cap, err, errlen);
@@ -78661,6 +78699,14 @@ int ds4_session_eval_speculative_argmax_ignoring_eos(
         return ds4_session_qwen4exp_spec_cycle(s, first_token, max_tokens,
                                                accepted, accepted_cap,
                                                err, errlen);
+    }
+    if (s && s->engine && s->engine->qwen4exp_session &&
+        s->engine->qwen4exp_session->mm_armed) {
+        /* See ds4_session_eval_speculative_argmax. */
+        if (!accepted || accepted_cap <= 0 || max_tokens <= 0) return 0;
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
     }
 #endif
     return ds4_session_eval_speculative_argmax_impl(
@@ -78704,6 +78750,14 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
         return ds4_session_qwen4exp_spec_cycle(s, first_token, max_tokens,
                                                accepted, accepted_cap,
                                                err, errlen);
+    }
+    if (s && s->engine && s->engine->qwen4exp_session &&
+        s->engine->qwen4exp_session->mm_armed) {
+        /* See ds4_session_eval_speculative_argmax. */
+        if (!accepted || accepted_cap <= 0 || max_tokens <= 0) return 0;
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
     }
 #endif
     if (temperature <= 0.0f) {
@@ -78825,6 +78879,16 @@ void ds4_session_invalidate(ds4_session *s) {
          * rewind, so anything less would leave the caches describing a prefix
          * the next sync does not replay. */
         ds4_qwen4exp_session_reset(s->engine->qwen4exp_session);
+        /* A discarded session cannot keep the multimodal arm: the next sync
+         * would see the arming flip (image -> text or the reverse) and
+         * invalidate the decode-graph table there, but any path that reaches
+         * rows() WITHOUT a fresh sync -- a resumed checkpoint the shim
+         * spliced in -- must not inherit an image-conditioned kernel set. */
+        if (s->engine->qwen4exp_session &&
+            s->engine->qwen4exp_session->mm_armed) {
+            s->engine->qwen4exp_session->mm_armed = 0;
+            ds4_gpu_decode_graphs_invalidate();
+        }
         /* And the carried draft.  It belongs to a position this reset just
          * threw away; a later round whose fed token happens to equal the stale
          * pending_parent would verify against it and commit two tokens while
