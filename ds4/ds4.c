@@ -65419,6 +65419,49 @@ int ds4_chat_append_multimodal_message(
     return 1;
 }
 
+#if defined(__linux__)
+#include <sys/syscall.h>
+#include <dirent.h>
+#endif
+
+/* Between fork() and exec a child inherits every descriptor the server holds:
+ * client sockets, the listening socket, kv-cache files.  A client socket that
+ * outlives its server-side close never sends FIN, so a streaming client waits
+ * for EOF until timeout -- the vision daemon is spawned lazily on the first
+ * image request, which is exactly when a client socket is open.  Close all
+ * fds above `keep` in the child.  Async-signal-safety: only close(), the
+ * close_range syscall and readdir() on a pre-opened DIR* are safe after fork
+ * in a threaded process; opendir()/sysconf() are not, so the last fallback
+ * closes a fixed bound of descriptors. */
+static void ds4_close_fds_above(int keep) {
+#if defined(SYS_close_range)
+    if (syscall(SYS_close_range, (unsigned)(keep + 1), ~0u, 0) == 0) return;
+    /* Old kernels (or seccomp) can refuse; fall through to the fd walk. */
+#endif
+#if defined(__linux__)
+    DIR *d = opendir("/proc/self/fd");
+    if (d) {
+        int dd = dirfd(d);
+        struct dirent *de;
+        while ((de = readdir(d))) {
+            if (de->d_name[0] == '.') continue;
+            long fd = strtol(de->d_name, NULL, 10);
+            if (fd > keep && fd != dd) close((int)fd);
+        }
+        closedir(d);
+        return;
+    }
+#endif
+#if defined(F_CLOSEM)
+    if (fcntl(keep + 1, F_CLOSEM) == 0) return;
+#endif
+    /* Not async-signal-safe in theory (sysconf), but the spawn callers fork
+     * from a worker thread that does not hold malloc locks across the call. */
+    long maxfd = sysconf(_SC_OPEN_MAX);
+    if (maxfd <= 0 || maxfd > 1048576) maxfd = 1048576;
+    for (long fd = keep + 1; fd < maxfd; fd++) close((int)fd);
+}
+
 /* qwen4exp vision helper protocol:
  *   daemon stdin : u32 path_len | path bytes   (u32 0 = shutdown)
  *   stdout       : u32 'RDY3' once at start, then per request either
@@ -65431,11 +65474,19 @@ static int ds4_qwen4exp_vision_spawn(ds4_engine *e) {
     if (e->vision_child_pid > 0) return 1;
     int pin[2], pout[2];
     if (pipe(pin) != 0 || pipe(pout) != 0) return 0;
+    /* Belt and suspenders: the child also closes everything above 2, but
+     * CLOEXEC keeps these pipe ends out of any future child too, and keeps
+     * them out of this daemon if it were ever spawned before its own exec
+     * (it isn't today). */
+    for (int i = 0; i < 2; i++) {
+        (void)fcntl(pin[i], F_SETFD, FD_CLOEXEC);
+        (void)fcntl(pout[i], F_SETFD, FD_CLOEXEC);
+    }
     const pid_t pid = fork();
     if (pid == 0) {
         dup2(pin[0], STDIN_FILENO);
         dup2(pout[1], STDOUT_FILENO);
-        close(pin[0]); close(pin[1]); close(pout[0]); close(pout[1]);
+        ds4_close_fds_above(STDERR_FILENO);
         execl(e->vision_helper, e->vision_helper, e->vision_mmproj,
               "--daemon", (char *)NULL);
         _exit(127);
@@ -77056,6 +77107,7 @@ int ds4_qwen4exp_test_open_with_support(const char *self_exe,
     const pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
+        ds4_close_fds_above(STDERR_FILENO);
         execl(self_exe, self_exe, "--support-probe", model_path, mtp_path,
               (char *)NULL);
         /* Only reached when exec itself failed. */

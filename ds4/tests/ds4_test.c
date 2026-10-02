@@ -6405,6 +6405,7 @@ static bool test_generate_chat_turn(ds4_engine *engine, ds4_session *session,
         free(piece);
         if (r->has_tools) {
             observe_tool_markers(text.ptr ? text.ptr : "",
+                                 text.len,
                                  &saw_tool_start, &saw_tool_end, NULL);
             if (saw_tool_end) {
                 finish = "tool_calls";
