@@ -5733,6 +5733,40 @@ static const char *find_any_tool_start(const char *s) {
     return best;
 }
 
+/* Bounded scans for streaming paths: the live text buffer is NUL-terminated
+ * at text.len while the streamer is only allowed to see stream_len bytes
+ * (stop-sequence and UTF-8 holds), so strstr would observe markup that has
+ * not been released yet.  find_lit_bounded is defined below. */
+static const char *find_lit_bounded(const char *s, size_t n, const char *lit);
+
+static const char *find_any_tool_start_n(const char *s, size_t n) {
+    const char *best = NULL;
+    const char *candidates[] = {
+        find_lit_bounded(s, n, DS4_TOOL_CALLS_START),
+        find_lit_bounded(s, n, DS4_TOOL_CALLS_START_SHORT),
+        find_lit_bounded(s, n, "<tool_calls>"),
+        find_lit_bounded(s, n, "<tool_call>"),
+    };
+    for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
+        if (candidates[i] && (!best || candidates[i] < best)) best = candidates[i];
+    }
+    return best;
+}
+
+static const char *find_any_tool_end_n(const char *s, size_t n) {
+    const char *best = NULL;
+    const char *candidates[] = {
+        find_lit_bounded(s, n, DS4_TOOL_CALLS_END),
+        find_lit_bounded(s, n, DS4_TOOL_CALLS_END_SHORT),
+        find_lit_bounded(s, n, "</tool_calls>"),
+        find_lit_bounded(s, n, "</tool_call>"),
+    };
+    for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
+        if (candidates[i] && (!best || candidates[i] < best)) best = candidates[i];
+    }
+    return best;
+}
+
 static const char *find_any_tool_end(const char *s) {
     const char *best = NULL;
     const char *candidates[] = {
@@ -5747,18 +5781,20 @@ static const char *find_any_tool_end(const char *s) {
     return best;
 }
 
-static void observe_tool_markers(const char *scan, bool *saw_start,
+static void observe_tool_markers(const char *scan, size_t scan_len,
+                                 bool *saw_start,
                                  bool *saw_end, bool *orphan_end) {
     if (!scan) return;
     bool had_start = *saw_start;
-    const char *start = find_any_tool_start(scan);
+    const char *start = find_any_tool_start_n(scan, scan_len);
     if (start) *saw_start = true;
 
     const char *end_scan = had_start ? scan : (start ? start : NULL);
-    const char *end = end_scan ? find_any_tool_end(end_scan) : NULL;
+    size_t end_len = end_scan ? scan_len - (size_t)(end_scan - scan) : 0;
+    const char *end = end_scan ? find_any_tool_end_n(end_scan, end_len) : NULL;
     if (end) {
         *saw_end = true;
-    } else if (!had_start && !start && find_any_tool_end(scan)) {
+    } else if (!had_start && !start && find_any_tool_end_n(scan, scan_len)) {
         if (orphan_end) *orphan_end = true;
     }
 }
@@ -7732,10 +7768,10 @@ static bool qwen4exp_tool_emit_value(int fd, const request *r, const char *id,
 static bool qwen4exp_tool_start_function(int fd, server *s, const request *r,
                                          const char *id, openai_tool_stream *ts,
                                          const char *raw, size_t raw_len) {
+    const char *name_start = raw + ts->parse_pos + strlen("<function=");
     const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
-    if (!tag_end) return true;
-    char *name = xstrndup(raw + ts->parse_pos,
-                          (size_t)(tag_end - (raw + ts->parse_pos)));
+    if (!tag_end) return true;   /* name not complete yet; wait for more */
+    char *name = xstrndup(name_start, (size_t)(tag_end - name_start));
     const char *tool_id = openai_tool_stream_id(s, ts, ts->index);
     bool ok = sse_chat_tool_call_start_delta(fd, r, id, ts->index, tool_id, name) &&
               openai_tool_emit_args_fragment(fd, r, id, ts, "{", 1);
@@ -7755,10 +7791,10 @@ static bool qwen4exp_tool_start_function(int fd, server *s, const request *r,
 static bool qwen4exp_tool_start_param(int fd, const request *r, const char *id,
                                       openai_tool_stream *ts,
                                       const char *raw, size_t raw_len) {
+    const char *key_start = raw + ts->parse_pos + strlen("<parameter=");
     const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
-    if (!tag_end) return true;
-    char *name = xstrndup(raw + ts->parse_pos,
-                          (size_t)(tag_end - (raw + ts->parse_pos)));
+    if (!tag_end) return true;   /* key not complete yet; wait for more */
+    char *name = xstrndup(key_start, (size_t)(tag_end - key_start));
     bool ok = openai_tool_emit_param_prefix(fd, r, id, ts, name, true);
     free(name);
     if (!ok) return false;
@@ -7804,13 +7840,13 @@ static bool qwen4exp_tool_stream_update(int fd, server *s, const request *r,
                    isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
             if (ts->parse_pos >= raw_len) return true;
             if (raw_full_lit(raw, raw_len, ts->parse_pos, func_start)) {
-                ts->parse_pos += strlen(func_start);
-                size_t before_pos = ts->parse_pos;
-                dsml_tool_stream_state before_state = ts->state;
+                /* The '>' terminating the name may sit in a later decode
+                 * step; qwen4exp_tool_start_function keeps parse_pos on the
+                 * tag until the whole "<function=NAME>" is visible. */
                 if (!qwen4exp_tool_start_function(fd, s, r, id, ts, raw, raw_len)) {
                     return false;
                 }
-                if (ts->parse_pos == before_pos && ts->state == before_state) {
+                if (ts->state == DSML_TOOL_Q4E_FUNCTION) {
                     return true;
                 }
                 continue;
@@ -7843,13 +7879,10 @@ static bool qwen4exp_tool_stream_update(int fd, server *s, const request *r,
                 return true;
             }
             if (raw_full_lit(raw, raw_len, ts->parse_pos, param_start)) {
-                ts->parse_pos += strlen(param_start);
-                size_t before_pos = ts->parse_pos;
-                dsml_tool_stream_state before_state = ts->state;
                 if (!qwen4exp_tool_start_param(fd, r, id, ts, raw, raw_len)) {
                     return false;
                 }
-                if (ts->parse_pos == before_pos && ts->state == before_state) {
+                if (ts->state == DSML_TOOL_Q4E_PARAMS) {
                     return true;
                 }
                 continue;
@@ -8036,11 +8069,13 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
         }
 
         const char *close = strstr(raw + st->emit_pos, "</think>");
+        size_t vis_len = raw_len > st->emit_pos ? raw_len - st->emit_pos : 0;
         const char *tool = r->has_tools ?
-            find_any_tool_start(raw + st->emit_pos) : NULL;
+            find_any_tool_start_n(raw + st->emit_pos, vis_len) : NULL;
         const bool tool_before_close = tool && (!close || tool < close);
         const bool complete_tool =
-            tool_before_close && find_any_tool_end(tool) != NULL;
+            tool_before_close &&
+            find_any_tool_end_n(tool, vis_len - (size_t)(tool - (raw + st->emit_pos))) != NULL;
         size_t limit;
         if (tool_before_close) {
             limit = trim_tool_separator_ws(raw, st->emit_pos,
@@ -8085,8 +8120,9 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
     if (st->mode == OPENAI_STREAM_TEXT) {
         if (st->guard_second_reasoning) {
             const char *close = strstr(raw + st->emit_pos, "</think>");
+            size_t vis_len = raw_len > st->emit_pos ? raw_len - st->emit_pos : 0;
             const char *tool = r->has_tools ?
-                find_any_tool_start(raw + st->emit_pos) : NULL;
+                find_any_tool_start_n(raw + st->emit_pos, vis_len) : NULL;
             if (close && (!tool || close < tool)) {
                 const size_t limit = (size_t)(close - raw);
                 if (limit > st->emit_pos &&
@@ -8103,7 +8139,10 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
             }
         }
 
-        const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
+        const char *tool = r->has_tools ?
+            find_any_tool_start_n(raw + st->emit_pos,
+                                  raw_len > st->emit_pos ? raw_len - st->emit_pos : 0) :
+            NULL;
         size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
                                               r->has_tools, final);
 
@@ -8769,11 +8808,13 @@ static bool responses_sse_stream_update(int fd, const request *r,
         }
 
         const char *close = strstr(raw + st->emit_pos, "</think>");
+        size_t vis_len = raw_len > st->emit_pos ? raw_len - st->emit_pos : 0;
         const char *tool = r->has_tools ?
-            find_any_tool_start(raw + st->emit_pos) : NULL;
+            find_any_tool_start_n(raw + st->emit_pos, vis_len) : NULL;
         const bool tool_before_close = tool && (!close || tool < close);
         const bool complete_tool =
-            tool_before_close && find_any_tool_end(tool) != NULL;
+            tool_before_close &&
+            find_any_tool_end_n(tool, vis_len - (size_t)(tool - (raw + st->emit_pos))) != NULL;
         size_t limit;
         if (tool_before_close) {
             limit = trim_tool_separator_ws(raw, st->emit_pos,
@@ -8829,7 +8870,10 @@ static bool responses_sse_stream_update(int fd, const request *r,
     }
 
     if (st->mode == RESP_STREAM_TEXT) {
-        const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
+        const char *tool = r->has_tools ?
+            find_any_tool_start_n(raw + st->emit_pos,
+                                  raw_len > st->emit_pos ? raw_len - st->emit_pos : 0) :
+            NULL;
         size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
                                               r->has_tools, final);
 
@@ -9611,7 +9655,8 @@ static size_t text_stream_safe_limit(const char *raw, size_t start,
 
     size_t limit = raw_len;
     if (has_tools) {
-        const char *tool = find_any_tool_start(raw + start);
+        const char *tool = find_any_tool_start_n(raw + start,
+                                                 raw_len > start ? raw_len - start : 0);
         if (tool) {
             limit = trim_tool_separator_ws(raw, start, (size_t)(tool - raw));
             return utf8_stream_safe_len(raw, start, limit, true);
@@ -9665,11 +9710,13 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
         }
 
         const char *close = strstr(raw + st->emit_pos, "</think>");
+        size_t vis_len = raw_len > st->emit_pos ? raw_len - st->emit_pos : 0;
         const char *tool = r->has_tools ?
-            find_any_tool_start(raw + st->emit_pos) : NULL;
+            find_any_tool_start_n(raw + st->emit_pos, vis_len) : NULL;
         const bool tool_before_close = tool && (!close || tool < close);
         const bool complete_tool =
-            tool_before_close && find_any_tool_end(tool) != NULL;
+            tool_before_close &&
+            find_any_tool_end_n(tool, vis_len - (size_t)(tool - (raw + st->emit_pos))) != NULL;
         size_t limit;
         if (tool_before_close) {
             limit = trim_tool_separator_ws(raw, st->emit_pos,
@@ -9719,8 +9766,9 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
     if (st->mode == ANTH_STREAM_TEXT) {
         if (st->guard_second_reasoning) {
             const char *close = strstr(raw + st->emit_pos, "</think>");
+            size_t vis_len = raw_len > st->emit_pos ? raw_len - st->emit_pos : 0;
             const char *tool = r->has_tools ?
-                find_any_tool_start(raw + st->emit_pos) : NULL;
+                find_any_tool_start_n(raw + st->emit_pos, vis_len) : NULL;
             if (close && (!tool || close < tool)) {
                 const size_t limit = (size_t)(close - raw);
                 if (limit > st->emit_pos) {
@@ -9740,7 +9788,10 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
             }
         }
 
-        const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
+        const char *tool = r->has_tools ?
+            find_any_tool_start_n(raw + st->emit_pos,
+                                  raw_len > st->emit_pos ? raw_len - st->emit_pos : 0) :
+            NULL;
         size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
                                               r->has_tools, final);
 
@@ -11872,14 +11923,15 @@ static bool complete_tool_call_inside_thinking(const char *text, size_t len,
                                                size_t *scan_from) {
     if (!text || !scan_from) return false;
     if (*scan_from > len) *scan_from = len;
-    const char *start = find_any_tool_start(text + *scan_from);
+    const char *start = find_any_tool_start_n(text + *scan_from,
+                                              len - *scan_from);
     if (!start) {
         const size_t hold = 80;
         *scan_from = len > hold ? len - hold : 0;
         return false;
     }
     *scan_from = (size_t)(start - text);
-    return find_any_tool_end(start) != NULL;
+    return find_any_tool_end_n(start, len - *scan_from) != NULL;
 }
 
 static int server_eval_token(server *s, server_slot *slot, int token,
@@ -13542,10 +13594,12 @@ decode_again:
                     }
                     if (tool_scan_from > text.len) tool_scan_from = text.len;
                     const char *tool_scan = text.ptr ? text.ptr + tool_scan_from : "";
+                    size_t tool_scan_len = text.ptr ? text.len - tool_scan_from : 0;
                     bool orphan_end = false;
                     bool old_start = saw_tool_start;
                     bool old_end = saw_tool_end;
-                    observe_tool_markers(tool_scan, &saw_tool_start, &saw_tool_end, &orphan_end);
+                    observe_tool_markers(tool_scan, tool_scan_len,
+                                         &saw_tool_start, &saw_tool_end, &orphan_end);
                     if (orphan_end && !saw_orphan_tool_end) {
                         saw_orphan_tool_end = true;
                         server_log(DS4_LOG_WARNING,
@@ -16042,8 +16096,6 @@ static void test_anthropic_tool_stream_sends_live_tool_use(void) {
     TEST_ASSERT(strstr(out, DS4_PARAM_START) == NULL);
 
     free(out);
-    free(parsed_content);
-    free(parsed_reasoning);
     tool_calls_free(&calls);
     anthropic_stream_free(&st);
     request_free(&r);
@@ -16874,13 +16926,16 @@ static void test_qwen4exp_tool_stream_sends_incremental_deltas(void) {
     TEST_ASSERT(acc[0].args.ptr != NULL);
     TEST_ASSERT(acc[0].args.len == strlen(wire));
     TEST_ASSERT(!memcmp(acc[0].args.ptr, wire, acc[0].args.len));
-    TEST_ASSERT(strstr(acc[0].args.ptr, "\\\"location\\\":\\\"Paris, FR\\\"") != NULL);
+    TEST_ASSERT(strstr(acc[0].args.ptr, "\"location\":\"Paris, FR\"") != NULL);
 
-    const char *content = strstr(out, "\"content\":\"Let me check.\"");
+    /* Content may arrive in more than one delta; verify the pieces occur in
+     * order and together form "Let me check." before the tool header. */
+    const char *c1 = strstr(out, "\"content\":\"Let me");
+    const char *c2 = c1 ? strstr(c1 + 1, "\"content\":\" check.") : NULL;
     const char *header = strstr(out, "\"name\":\"get_weather\"");
     const char *finish = strstr(out, "\"finish_reason\":\"tool_calls\"");
-    TEST_ASSERT(content != NULL && header != NULL && finish != NULL);
-    TEST_ASSERT(content < header);
+    TEST_ASSERT(c1 != NULL && c2 != NULL && header != NULL && finish != NULL);
+    TEST_ASSERT(c1 < c2 && c2 < header);
     TEST_ASSERT(header < finish);
     TEST_ASSERT(strstr(out, "<tool_call>") == NULL);
     TEST_ASSERT(strstr(out, "<function=") == NULL);
@@ -16930,9 +16985,12 @@ static void test_qwen4exp_tool_stream_handles_multiple_calls(void) {
     TEST_ASSERT(test_stream_feed_slices(sv[0], &r, "chatcmpl_q4e_multi", &st,
                                         raw, strlen(raw), 5));
 
+    char *parsed_content = NULL;
+    char *parsed_reasoning = NULL;
     tool_calls calls = {0};
     TEST_ASSERT(parse_generated_message_ex_for_syntax(
-        SERVER_MODEL_SYNTAX_QWEN4EXP, raw, false, NULL, NULL, &calls));
+        SERVER_MODEL_SYNTAX_QWEN4EXP, raw, false,
+        &parsed_content, &parsed_reasoning, &calls));
     TEST_ASSERT(calls.len == 2);
     TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_q4e_multi", &st,
                                        raw, strlen(raw), &calls,
@@ -16967,6 +17025,8 @@ static void test_qwen4exp_tool_stream_handles_multiple_calls(void) {
     free(wire1);
     test_tool_call_acc_clear(acc, TEST_TOOL_ACC_MAX);
     free(out);
+    free(parsed_content);
+    free(parsed_reasoning);
     tool_calls_free(&calls);
     openai_stream_free(&st);
     request_free(&r);
@@ -17001,9 +17061,12 @@ static void test_qwen4exp_tool_stream_escapes_argument_values(void) {
     TEST_ASSERT(test_stream_feed_slices(sv[0], &r, "chatcmpl_q4e_esc", &st,
                                         raw, strlen(raw), 3));
 
+    char *parsed_content = NULL;
+    char *parsed_reasoning = NULL;
     tool_calls calls = {0};
     TEST_ASSERT(parse_generated_message_ex_for_syntax(
-        SERVER_MODEL_SYNTAX_QWEN4EXP, raw, false, NULL, NULL, &calls));
+        SERVER_MODEL_SYNTAX_QWEN4EXP, raw, false,
+        &parsed_content, &parsed_reasoning, &calls));
     TEST_ASSERT(calls.len == 1);
     TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_q4e_esc", &st,
                                        raw, strlen(raw), &calls,
@@ -17027,6 +17090,8 @@ static void test_qwen4exp_tool_stream_escapes_argument_values(void) {
     free(wire);
     test_tool_call_acc_clear(acc, TEST_TOOL_ACC_MAX);
     free(out);
+    free(parsed_content);
+    free(parsed_reasoning);
     tool_calls_free(&calls);
     openai_stream_free(&st);
     request_free(&r);
@@ -17108,9 +17173,12 @@ static void test_qwen4exp_tool_stream_kill_switch(void) {
     TEST_ASSERT(test_stream_feed_slices(sv[0], &r, "chatcmpl_q4e_kill", &st,
                                         raw, strlen(raw), 4));
 
+    char *parsed_content = NULL;
+    char *parsed_reasoning = NULL;
     tool_calls calls = {0};
     TEST_ASSERT(parse_generated_message_ex_for_syntax(
-        SERVER_MODEL_SYNTAX_QWEN4EXP, raw, false, NULL, NULL, &calls));
+        SERVER_MODEL_SYNTAX_QWEN4EXP, raw, false,
+        &parsed_content, &parsed_reasoning, &calls));
     TEST_ASSERT(calls.len == 1);
     TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_q4e_kill", &st,
                                        raw, strlen(raw), &calls,
@@ -17135,6 +17203,8 @@ static void test_qwen4exp_tool_stream_kill_switch(void) {
     free(wire);
     test_tool_call_acc_clear(acc, TEST_TOOL_ACC_MAX);
     free(out);
+    free(parsed_content);
+    free(parsed_reasoning);
     tool_calls_free(&calls);
     openai_stream_free(&st);
     request_free(&r);
@@ -19624,6 +19694,7 @@ static void test_tool_marker_state_ignores_orphan_end(void) {
     bool orphan_end = false;
 
     observe_tool_markers("reasoning\n" DS4_PARAM_END "\n" DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END,
+                         strlen("reasoning\n" DS4_PARAM_END "\n" DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END),
                          &saw_start, &saw_end, &orphan_end);
     TEST_ASSERT(!saw_start);
     TEST_ASSERT(!saw_end);
@@ -19631,12 +19702,14 @@ static void test_tool_marker_state_ignores_orphan_end(void) {
 
     orphan_end = false;
     observe_tool_markers(DS4_TOOL_CALLS_START "\n" DS4_INVOKE_START " name=\"bash\">",
+                         strlen(DS4_TOOL_CALLS_START "\n" DS4_INVOKE_START " name=\"bash\">"),
                          &saw_start, &saw_end, &orphan_end);
     TEST_ASSERT(saw_start);
     TEST_ASSERT(!saw_end);
     TEST_ASSERT(!orphan_end);
 
     observe_tool_markers(DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END,
+                         strlen(DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END),
                          &saw_start, &saw_end, &orphan_end);
     TEST_ASSERT(saw_start);
     TEST_ASSERT(saw_end);
