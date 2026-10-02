@@ -547,6 +547,62 @@ static int serve_line(const resident *r, int fd, const char *line) {
              (frontiers.len == 0 || buf_puts(&out, frontiers.data)) &&
              buf_puts(&out, "]}");
         free(frontiers.data);
+    } else if (!strcmp(op, "run_sampled")) {
+        /* The serial twin of spec_run_sampled: same fields, same field
+         * parsing, same RNG stream discipline -- but each step is the plain
+         * ds4s_eval + ds4s_sample pair the non-speculative decode always
+         * used, one token at a time.  This is the distribution check's
+         * serial reference leg; the spec leg must be indistinguishable from
+         * it at the A/A level.  The frontier after a prompt is already
+         * materialised, so the first draw needs no eval. */
+        long long count = 0, first = 0, top_k = 0;
+        uint64_t seed = 0;
+        if (field_int(line, "count", &count) != 0 ||
+            count <= 0 || count > RESIDENT_MAX_RUN ||
+            field_u64(line, "seed", &seed) != 0) {
+            free(out.data);
+            return send_error(fd, "run_sampled needs a \"count\" in "
+                                  "1..65536 and an unsigned \"seed\"") ? 1 : -1;
+        }
+        double temperature = 1.0, top_p = 1.0, min_p = 0.0;
+        {   const char *at;
+            if ((at = field(line, "temperature"))) temperature = strtod(at, NULL);
+            if ((at = field(line, "top_p")))       top_p = strtod(at, NULL);
+            if ((at = field(line, "min_p")))       min_p = strtod(at, NULL);
+        }
+        if (field_int(line, "top_k", &top_k) != 0) top_k = 0;
+        uint64_t rng = seed;
+        int32_t pending;
+        if (field_int(line, "first_token", &first) == 0) {
+            pending = (int32_t)first;
+        } else {
+            const int32_t t = ds4s_sample(r->h, (float)temperature, (int)top_k,
+                                          (float)top_p, (float)min_p, &rng);
+            if (t < 0) {
+                free(out.data);
+                return send_error(fd, ds4s_last_error(r->h)) ? 1 : -1;
+            }
+            pending = t;
+        }
+        long long produced = 0;
+        ok = buf_puts(&out, "{\"ok\":true,\"rounds\":[[");
+        for (; ok && produced < count; produced++) {
+            ok = buf_printf(&out, "%s%d", produced ? "," : "", (int)pending);
+            if (produced + 1 >= count) break;
+            if (ds4s_eval(r->h, pending) != 0) {
+                free(out.data);
+                return send_error(fd, ds4s_last_error(r->h)) ? 1 : -1;
+            }
+            const int32_t next = ds4s_sample(r->h, (float)temperature,
+                                             (int)top_k, (float)top_p,
+                                             (float)min_p, &rng);
+            if (next < 0) {
+                free(out.data);
+                return send_error(fd, ds4s_last_error(r->h)) ? 1 : -1;
+            }
+            pending = next;
+        }
+        ok = ok && buf_puts(&out, "]]}");
     } else if (!strcmp(op, "spec_counters")) {
         uint64_t drafts = 0, hits = 0, quenches = 0, disagreements = 0;
         ds4s_spec_counters(r->h, &drafts, &hits, &quenches, &disagreements);
