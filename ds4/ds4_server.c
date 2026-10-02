@@ -6928,6 +6928,22 @@ static bool sse_done(int fd, const request *r, const char *id,
            send_all(fd, "data: [DONE]\n\n", 14);
 }
 
+/* Last-chance stream termination: a streaming exit path that skips the normal
+ * finish emit (cancellation, abort before the completion response is built)
+ * still owes the client a terminal record, otherwise it waits on the socket
+ * for bytes that never come.  OpenAI streams get the same error object used by
+ * send_prefill_failure_response plus "data: [DONE]"; Anthropic and Responses
+ * streams end on the error event frame (their SSE dialects have no [DONE]).
+ * Writes are best-effort: when the cancellation came from a dead client
+ * socket, send_all fails fast and nothing depends on the result. */
+static void stream_abort_terminal(int fd, const request *r, const char *msg) {
+    if (!r || !r->stream || fd < 0) return;
+    (void)sse_error_event(fd, r, msg);
+    if (r->api == API_OPENAI) {
+        (void)send_all(fd, "data: [DONE]\n\n", 14);
+    }
+}
+
 static bool sse_chat_finish(int fd, const request *r, const char *id, const char *content,
                             const char *reasoning, const tool_calls *calls, const char *finish,
                             int prompt_tokens, int completion_tokens) {
@@ -12407,6 +12423,10 @@ static void send_prefill_failure_response(server *s, const job *j,
                        "ds4-server: %s ctx=%s%s%s prefill SSE error failed: %s",
                        kind, ctx, flags && flags[0] ? " " : "",
                        flags && flags[0] ? flags : "", err);
+        } else if (j->req.api == API_OPENAI) {
+            /* The error event is the last record; end the stream so OpenAI
+             * clients stop waiting on the socket. */
+            (void)send_all(j->fd, "data: [DONE]\n\n", 14);
         }
         return;
     }
@@ -13204,6 +13224,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             if (job_cancelled(j)) {
                 request_live_state_clear(s, slot);
                 trace_event(s, trace_id, "cancelled during prefill");
+                if (progress.headers_sent)
+                    stream_abort_terminal(j->fd, &j->req,
+                                          "cancelled during prefill");
                 return;
             }
             trace_event(s, trace_id, "prefill failed: %s", err);
@@ -13238,6 +13261,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         if (job_cancelled(j)) {
             request_live_state_clear(s, slot);
             trace_event(s, trace_id, "cancelled during prefill");
+            if (progress.headers_sent)
+                stream_abort_terminal(j->fd, &j->req,
+                                      "cancelled during prefill");
             return;
         }
         trace_event(s, trace_id, "prefill failed: %s", err);
@@ -13250,6 +13276,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         ds4_session_set_display_progress(slot->session, NULL, NULL);
         request_live_state_clear(s, slot);
         trace_event(s, trace_id, "cancelled after prefill");
+        if (progress.headers_sent)
+            stream_abort_terminal(j->fd, &j->req, "cancelled after prefill");
         ds4_tokens_free(&effective_prompt);
         return;
     }
@@ -13297,6 +13325,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                        ctx_span,
                        req_flags[0] ? " " : "",
                        req_flags);
+            stream_abort_terminal(j->fd, &j->req,
+                                  "stream closed during prefill");
             request_live_state_clear(s, slot);
             ds4_tokens_free(&effective_prompt);
             return;
@@ -13312,6 +13342,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                        ctx_span,
                        req_flags[0] ? " " : "",
                        req_flags);
+            stream_abort_terminal(j->fd, &j->req, "sse headers failed");
             request_live_state_clear(s, slot);
             ds4_tokens_free(&effective_prompt);
             return;
@@ -13322,6 +13353,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                       prompt_tokens, &anthropic_live)) {
             job_mark_cancelled(j);
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s anthropic stream start failed", ctx_span);
+            stream_abort_terminal(j->fd, &j->req,
+                                  "anthropic stream start failed");
             request_live_state_clear(s, slot);
             ds4_tokens_free(&effective_prompt);
             return;
@@ -13330,6 +13363,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             !sse_chunk(j->fd, &j->req, id, NULL, NULL)) {
             job_mark_cancelled(j);
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s openai role chunk failed", ctx_span);
+            stream_abort_terminal(j->fd, &j->req, "openai stream start failed");
             request_live_state_clear(s, slot);
             ds4_tokens_free(&effective_prompt);
             return;
@@ -13345,6 +13379,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                            ctx_span,
                            req_flags[0] ? " " : "",
                            req_flags);
+                stream_abort_terminal(j->fd, &j->req,
+                                      "responses stream start failed");
                 responses_stream_free(&responses_live);
                 request_live_state_clear(s, slot);
                 ds4_tokens_free(&effective_prompt);
@@ -13668,6 +13704,7 @@ decode_again:
     if (job_cancelled(j)) {
         request_live_state_clear(s, slot);
         trace_event(s, trace_id, "cancelled during generation after %d tokens", completion);
+        stream_abort_terminal(j->fd, &j->req, "cancelled during generation");
         anthropic_stream_free(&anthropic_live);
         openai_stream_free(&openai_live);
         responses_stream_free(&responses_live);
@@ -13782,6 +13819,7 @@ decode_again:
     if (job_cancelled(j)) {
         request_live_state_clear(s, slot);
         trace_event(s, trace_id, "cancelled while flushing generation");
+        stream_abort_terminal(j->fd, &j->req, "cancelled while flushing");
         anthropic_stream_free(&anthropic_live);
         openai_stream_free(&openai_live);
         responses_stream_free(&responses_live);
@@ -13897,6 +13935,7 @@ decode_again:
         if (job_cancelled(j)) {
             request_live_state_clear(s, slot);
             trace_event(s, trace_id, "cancelled during response parsing");
+            stream_abort_terminal(j->fd, &j->req, "cancelled during response");
             free(parsed_content);
             free(parsed_reasoning);
             tool_calls_free(&parsed_calls);
@@ -13921,6 +13960,7 @@ decode_again:
     if (job_cancelled(j)) {
         request_live_state_clear(s, slot);
         trace_event(s, trace_id, "cancelled before publishing response state");
+        stream_abort_terminal(j->fd, &j->req, "cancelled before response");
         free(parsed_content);
         free(parsed_reasoning);
         tool_calls_free(&parsed_calls);
@@ -13996,6 +14036,7 @@ decode_again:
     }
 
     bool response_ok = !job_cancelled(j);
+    bool terminal_sent = false;
     if (response_ok && j->req.stream) {
         if (j->req.api == API_ANTHROPIC) {
             response_ok = anthropic_sse_finish_live(j->fd, s, &j->req, id, &anthropic_live,
@@ -14048,11 +14089,20 @@ decode_again:
                                      &parsed_calls, final_finish,
                                      prompt_tokens, completion);
     }
+    if (j->req.stream) terminal_sent = response_ok;
     if (job_cancelled(j)) response_ok = false;
+    if (!response_ok && j->req.stream && !terminal_sent) {
+        /* A live client that only aborted server-side still needs the
+         * terminal record; on a dead socket this fails fast and cheap.  When
+         * the finish emit itself wrote the terminal chunk, do not append a
+         * second error record after it. */
+        stream_abort_terminal(j->fd, &j->req,
+                              err[0] ? err : "stream terminated early");
+    }
     if (!response_ok) {
         job_mark_cancelled(j);
         final_finish = "error";
-        snprintf(err, sizeof(err), "client disconnected");
+        if (!err[0]) snprintf(err, sizeof(err), "client disconnected");
         request_live_state_clear(s, slot);
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: %s ctx=%s%s%s client disconnected",
@@ -17206,6 +17256,141 @@ static void test_qwen4exp_tool_stream_kill_switch(void) {
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&calls);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+
+/* A request cancelled mid-stream still owes the client a terminal record:
+ * stream_abort_terminal writes the OpenAI error event plus [DONE]. */
+static void test_stream_abort_terminal_writes_error_and_done(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+
+    stream_abort_terminal(sv[0], &r, "cancelled during generation");
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(out != NULL);
+    TEST_ASSERT(strstr(out, "event: error") != NULL);
+    TEST_ASSERT(strstr(out, "cancelled during generation") != NULL);
+    TEST_ASSERT(strstr(out, "data: [DONE]") != NULL);
+    /* The error record must precede [DONE]. */
+    TEST_ASSERT(strstr(out, "event: error") < strstr(out, "data: [DONE]"));
+    free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+/* Anthropic streams end on the error frame; they have no [DONE] sentinel. */
+static void test_stream_abort_terminal_anthropic_has_no_done(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC;
+    r.stream = true;
+
+    stream_abort_terminal(sv[0], &r, "cancelled during generation");
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(out != NULL);
+    TEST_ASSERT(strstr(out, "\"type\":\"error\"") != NULL);
+    TEST_ASSERT(strstr(out, "api_error") != NULL);
+    TEST_ASSERT(strstr(out, "[DONE]") == NULL);
+    free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+/* The hang seen live: thinking + tools, tokens run out inside the tool call.
+ * The finish emit must still produce the finish_reason=error chunk and
+ * [DONE] even though the stream FSM is parked inside THINKING with a
+ * complete-but-unclosed tool block. */
+static void test_openai_stream_error_finish_terminates(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = true;
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN4EXP;
+
+    TEST_ASSERT(sse_chunk(sv[0], &r, "chatcmpl_err", NULL, NULL));
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    /* max_tokens reached while the tool call is still open: </think> never
+     * arrived, </tool_call> never arrived. */
+    const char *raw =
+        "<think>checking</think>"
+        "<tool_call>\n<function=bash>\n"
+        "<parameter=command>\nwc -l /var/log/sys";
+    TEST_ASSERT(test_stream_feed_slices(sv[0], &r, "chatcmpl_err", &st,
+                                        raw, strlen(raw), 5));
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_err", &st,
+                                       raw, strlen(raw), NULL,
+                                       "error", 10, 4));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(out != NULL);
+    TEST_ASSERT(strstr(out, "\"finish_reason\":\"error\"") != NULL);
+    TEST_ASSERT(strstr(out, "data: [DONE]") != NULL);
+    TEST_ASSERT(strstr(out, "<tool_call>") == NULL);
+    free(out);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+/* Same shape while the tool call starts inside unclosed thinking. */
+static void test_openai_stream_error_finish_inside_thinking(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = true;
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN4EXP;
+
+    TEST_ASSERT(sse_chunk(sv[0], &r, "chatcmpl_err2", NULL, NULL));
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw =
+        "<think>still thinking... <tool_call>\n<function=bash>\n"
+        "<parameter=command>\npwd";
+    TEST_ASSERT(test_stream_feed_slices(sv[0], &r, "chatcmpl_err2", &st,
+                                        raw, strlen(raw), 5));
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_err2", &st,
+                                       raw, strlen(raw), NULL,
+                                       "error", 10, 4));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(out != NULL);
+    TEST_ASSERT(strstr(out, "\"finish_reason\":\"error\"") != NULL);
+    TEST_ASSERT(strstr(out, "data: [DONE]") != NULL);
+    free(out);
     openai_stream_free(&st);
     request_free(&r);
     close(sv[0]);
@@ -20888,6 +21073,10 @@ static void ds4_server_unit_tests_run(void) {
     test_qwen4exp_tool_stream_escapes_argument_values();
     test_qwen4exp_tool_stream_truncated_call();
     test_qwen4exp_tool_stream_kill_switch();
+    test_stream_abort_terminal_writes_error_and_done();
+    test_stream_abort_terminal_anthropic_has_no_done();
+    test_openai_stream_error_finish_terminates();
+    test_openai_stream_error_finish_inside_thinking();
     test_streaming_holds_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();
     test_parse_glm_tool_call_message();
