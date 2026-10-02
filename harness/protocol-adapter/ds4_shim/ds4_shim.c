@@ -337,6 +337,39 @@ int ds4s_eval_speculative(ds4s_handle *h, int32_t first_token, int budget, int32
     return written;
 }
 
+int32_t ds4s_sample(ds4s_handle *h, float temperature, int top_k,
+                    float top_p, float min_p, uint64_t *rng) {
+    if (!h || !rng) return -1;
+    return (int32_t)ds4_session_sample(h->session, temperature, top_k,
+                                       top_p, min_p, rng);
+}
+
+int ds4s_eval_speculative_sampled(ds4s_handle *h, int32_t first_token,
+                                  int budget, float temperature, int top_k,
+                                  float top_p, float min_p, uint64_t *rng,
+                                  int32_t *out, int cap) {
+    if (!h || !out || !rng || cap <= 0 || budget <= 0) return -1;
+    int accepted[17];
+    int want = cap < 17 ? cap : 17;
+    if (want > budget) want = budget;
+    char err[256] = {0};
+    /* eos_token -1 never matches: the benchmark commits an exact token count
+     * and does not stop at end-of-sequence -- same contract as the greedy
+     * wrapper above. */
+    const int n = ds4_session_eval_speculative(h->session, (int)first_token,
+                                               budget, -1, temperature, top_k,
+                                               top_p, min_p, rng,
+                                               accepted, want, err,
+                                               sizeof(err));
+    if (n <= 0) {
+        set_err(h, err[0] ? err : "ds4_session_eval_speculative failed");
+        return -1;
+    }
+    const int written = n < cap ? n : cap;
+    for (int i = 0; i < written; i++) out[i] = (int32_t)accepted[i];
+    return written;
+}
+
 void ds4s_spec_counters(const ds4s_handle *h, uint64_t *drafts, uint64_t *hits,
                         uint64_t *quenches, uint64_t *disagreements) {
     /* The port owns these. ds4_session_qwen4exp_spec_counters() returns

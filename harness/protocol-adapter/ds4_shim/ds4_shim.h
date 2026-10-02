@@ -96,6 +96,22 @@ int ds4s_top_logits(const ds4s_handle *h, int k, int32_t *ids, float *logits);
 int ds4s_eval_speculative(ds4s_handle *h, int32_t first_token, int budget, int32_t *out,
                           int cap);
 
+/* Sample one token from the current logits under the request parameters.
+ * `rng` is the request's u64 state, advanced per draw exactly as the server's
+ * own sampler advances its request RNG. */
+int32_t ds4s_sample(ds4s_handle *h, float temperature, int top_k,
+                    float top_p, float min_p, uint64_t *rng);
+
+/* One sampled speculative cycle: the same framing as ds4s_eval_speculative
+ * but the accept test is the request distribution's mass on the drafted
+ * token, and a rejecting round commits a replacement drawn from the row
+ * with the draft's mass removed.  Output semantics are unchanged: `out[0] ==
+ * first_token`, logits for the new frontier are ready afterwards. */
+int ds4s_eval_speculative_sampled(ds4s_handle *h, int32_t first_token,
+                                  int budget, float temperature, int top_k,
+                                  float top_p, float min_p, uint64_t *rng,
+                                  int32_t *out, int cap);
+
 /* The speculative cycle's counters, read from the port itself
  * (ds4_session_qwen4exp_spec_counters). Read before and after a phase and take
  * the difference.

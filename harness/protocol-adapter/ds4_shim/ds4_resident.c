@@ -452,6 +452,72 @@ static int serve_line(const resident *r, int fd, const char *line) {
              (frontiers.len == 0 || buf_puts(&out, frontiers.data)) &&
              buf_printf(&out, "],\"token\":%d}", (int)ds4s_argmax(r->h));
         free(frontiers.data);
+    } else if (!strcmp(op, "spec_run_sampled")) {
+        /* The sampled twin of spec_run: one whole sampled run in a request.
+         * The first token is sampled from the prompt's frontier (the request's
+         * own distribution, same RNG stream), each cycle is the exact
+         * point-mass leg, and the boundary token is sampled from the frontier
+         * the round left.  Required fields: count, seed; optional temperature
+         * (default 1.0), top_k, top_p, min_p, first_token (sampled when
+         * absent). */
+        long long count = 0, seed = 0, first = 0, top_k = 0;
+        if (field_int(line, "count", &count) != 0 ||
+            count <= 0 || count > RESIDENT_MAX_RUN ||
+            field_int(line, "seed", &seed) != 0) {
+            free(out.data);
+            return send_error(fd, "spec_run_sampled needs a \"count\" in "
+                                  "1..65536 and a \"seed\"") ? 1 : -1;
+        }
+        double temperature = 1.0, top_p = 1.0, min_p = 0.0;
+        {   const char *at;
+            if ((at = field(line, "temperature"))) temperature = strtod(at, NULL);
+            if ((at = field(line, "top_p")))       top_p = strtod(at, NULL);
+            if ((at = field(line, "min_p")))       min_p = strtod(at, NULL);
+        }
+        if (field_int(line, "top_k", &top_k) != 0) top_k = 0;
+        uint64_t rng = (uint64_t)seed;
+        int32_t pending;
+        if (field_int(line, "first_token", &first) == 0) {
+            pending = (int32_t)first;
+        } else {
+            const int32_t t = ds4s_sample(r->h, (float)temperature, (int)top_k,
+                                          (float)top_p, (float)min_p, &rng);
+            if (t < 0) {
+                free(out.data);
+                return send_error(fd, ds4s_last_error(r->h)) ? 1 : -1;
+            }
+            pending = t;
+        }
+        buf frontiers = {0};
+        long long produced = 0;
+        ok = buf_puts(&out, "{\"ok\":true,\"rounds\":[");
+        for (int cycle = 0; ok && produced < count; cycle++) {
+            int32_t committed[RESIDENT_MAX_SPEC];
+            const int n = ds4s_eval_speculative_sampled(
+                r->h, pending, (int)(count - produced),
+                (float)temperature, (int)top_k, (float)top_p, (float)min_p,
+                &rng, committed, RESIDENT_MAX_SPEC);
+            if (n < 0) {
+                free(out.data);
+                free(frontiers.data);
+                return send_error(fd, ds4s_last_error(r->h)) ? 1 : -1;
+            }
+            const int32_t next = ds4s_sample(r->h, (float)temperature,
+                                             (int)top_k, (float)top_p,
+                                             (float)min_p, &rng);
+            ok = buf_puts(&out, cycle ? ",[" : "[");
+            for (int i = 0; ok && i < n; i++)
+                ok = buf_printf(&out, "%s%d", i ? "," : "", (int)committed[i]);
+            ok = ok && buf_puts(&out, "]") &&
+                 buf_printf(&frontiers, "%s%d", cycle ? "," : "", (int)next);
+            if (n == 0 || committed[0] != pending) break;
+            produced += n;
+            pending = next;
+        }
+        ok = ok && buf_puts(&out, "],\"frontiers\":[") &&
+             (frontiers.len == 0 || buf_puts(&out, frontiers.data)) &&
+             buf_puts(&out, "]}");
+        free(frontiers.data);
     } else if (!strcmp(op, "spec_counters")) {
         uint64_t drafts = 0, hits = 0, quenches = 0, disagreements = 0;
         ds4s_spec_counters(r->h, &drafts, &hits, &quenches, &disagreements);
