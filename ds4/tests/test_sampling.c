@@ -354,8 +354,178 @@ static void check_speculative_distribution(void) {
            (double)counts[2] / trials);
 }
 
+/*
+ * The qwen4exp sampled cycle's one-position rule, exercised through the
+ * production hook: accept the point draft with probability p(d), else sample
+ * the replacement from p with d removed.  Chi-square over >= 1e6 draws per
+ * case against p itself, with the zero-mass draft and the chained
+ * (two-position) composition covered the same way.
+ *
+ * df = k - 1 over the support, and the bound is the normal tail at six
+ * standard deviations of the chi-square, p ~= 1e-9 -- comfortably below any
+ * single-run flakiness and far above the resolution 1e6 draws give.
+ */
+static void check_point_sample_case(const char *label,
+                                    const float *logits, uint32_t n_vocab,
+                                    int draft, float temperature,
+                                    int top_k, float top_p, float min_p,
+                                    uint32_t draws, uint64_t seed) {
+    float *expect = malloc((size_t)n_vocab * sizeof(*expect));
+    float *probs = malloc((size_t)n_vocab * sizeof(*probs));
+    double *counts = calloc(n_vocab, sizeof(*counts));
+    CHECK(expect && probs && counts, "%s: allocation", label);
+    if (!expect || !probs || !counts) {
+        free(expect); free(probs); free(counts);
+        return;
+    }
+    CHECK(ds4_test_sampling_probabilities(logits, n_vocab, temperature,
+                                          top_k, top_p, min_p, expect) != 0,
+          "%s: expected distribution", label);
+    uint64_t rng = seed;
+    for (uint32_t i = 0; i < draws; i++) {
+        const int tok = ds4_test_speculative_point_sample(
+            logits, n_vocab, draft, temperature, top_k, top_p, min_p,
+            &rng, probs);
+        CHECK(tok >= 0 && (uint32_t)tok < n_vocab,
+              "%s: draw %u returned %d", label, i, tok);
+        if (tok >= 0 && (uint32_t)tok < n_vocab) counts[tok] += 1.0;
+    }
+    double chi2 = 0.0;
+    uint32_t df = 0;
+    double tv = 0.0;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const double e = (double)expect[i] * draws;
+        if (e > 0.0) df++;
+        const double o = counts[i];
+        if (e > 0.0) chi2 += (o - e) * (o - e) / e;
+        else CHECK(o == 0.0,
+                   "%s: token %u drawn %.0f times with zero mass",
+                   label, i, o);
+        tv += fabs(counts[i] / draws - (double)expect[i]);
+    }
+    tv *= 0.5;
+    if (df == 0) df = 1;
+    const double dfm1 = (double)(df - 1);
+    const double bound = dfm1 + 6.0 * sqrt(2.0 * dfm1);
+    CHECK(chi2 <= bound,
+          "%s: chi2 %.1f over %u df exceeds the 6-sigma bound %.1f "
+          "(TV %.5f)",
+          label, chi2, df - 1, bound, tv);
+    printf("  point-sample %-28s draws=%u df=%u chi2=%.1f bound=%.1f "
+           "TV=%.5f\n", label, draws, df - 1, chi2, bound, tv);
+    free(expect); free(probs); free(counts);
+}
+
+static void check_point_sample_distribution(void) {
+    printf("point-mass speculative sampling vs p, chi-square over "
+           ">=1e6 draws per case\n");
+    /* Drafts with large, middling and tiny mass; truncation cases exercise
+     * top_k, top_p and min_p through the production probability builder. */
+    static const float flat[] = {
+        logf(0.30f), logf(0.25f), logf(0.20f), logf(0.15f), logf(0.10f),
+    };
+    check_point_sample_case("flat draft=pmax", flat, 5, 0,
+                            1.0f, 0, 1.0f, 0.0f, 1000000, 0x1234ULL);
+    check_point_sample_case("flat draft=mid", flat, 5, 2,
+                            1.0f, 0, 1.0f, 0.0f, 1000000, 0x5678ULL);
+    check_point_sample_case("flat draft=min", flat, 5, 4,
+                            1.0f, 0, 1.0f, 0.0f, 1000000, 0x9abcULL);
+    check_point_sample_case("top_k=2 truncates draft", flat, 5, 4,
+                            1.0f, 2, 1.0f, 0.0f, 1000000, 0xdef0ULL);
+    check_point_sample_case("top_p=0.55", flat, 5, 1,
+                            1.0f, 0, 0.55f, 0.0f, 1000000, 0x1357ULL);
+    check_point_sample_case("min_p=0.5 drops draft", flat, 5, 3,
+                            0.6f, 0, 1.0f, 0.5f, 1000000, 0x2468ULL);
+    /* High-temperature flat row: draft mass 1/5, mostly replaced. */
+    check_point_sample_case("temp 2.0 mid draft", flat, 5, 2,
+                            2.0f, 0, 1.0f, 0.0f, 1000000, 0xabcdULL);
+}
+
+/*
+ * The chained rule: position 0 accepts d0 with p0(d0) and position 1 is
+ * reached only when d0 stood.  Enumerate the two-position outcome
+ * probabilities exactly -- (d0, d1), (d0, r1) on accept, (r0, .) on reject,
+ * where the second position is never evaluated on reject -- and chi-square
+ * the observed (row, token) pairs over >=1e6 rounds. */
+static void check_point_sample_chained(void) {
+    static const float logits0[] = {
+        logf(0.40f), logf(0.30f), logf(0.20f), logf(0.10f),
+    };
+    static const float logits1[] = {
+        logf(0.10f), logf(0.20f), logf(0.30f), logf(0.40f),
+    };
+    enum { N = 4, D0 = 1, D1 = 2, DRAWS = 1500000 };
+    float p0[N], p1[N], probs[N];
+    CHECK(ds4_test_sampling_probabilities(logits0, N, 1.0f, 0, 1.0f, 0.0f,
+                                          p0) != 0, "chained p0");
+    CHECK(ds4_test_sampling_probabilities(logits1, N, 1.0f, 0, 1.0f, 0.0f,
+                                          p1) != 0, "chained p1");
+    /* Expected outcomes: (D0, D1) with p0[D0]*p1[D1]; (D0, r1 != D1) with
+     * p0[D0] * p1[r1] -- the renormalized replacement draw p1[r]/(1-p1[D1])
+     * times the rejection mass (1-p1[D1]) is exactly p1[r1]; and (r0 != D0,
+     * none) with p0[r0], because the second position is never evaluated on a
+     * first-position reject. */
+    double exp_pair[N][N + 1];
+    memset(exp_pair, 0, sizeof(exp_pair));
+    const double pd0 = p0[D0];
+    const double pd1 = p1[D1];
+    for (int r0 = 0; r0 < N; r0++) {
+        if (r0 == D0) continue;
+        exp_pair[r0][N] = p0[r0];              /* reject at 0: (r0, none) */
+    }
+    exp_pair[D0][D1] = pd0 * pd1;              /* both drafts accepted */
+    for (int t1 = 0; t1 < N; t1++) {
+        if (t1 == D1) continue;
+        exp_pair[D0][t1] = pd0 * p1[t1];       /* reject at 1: replacement */
+    }
+
+    double obs_pair[N][N + 1];
+    memset(obs_pair, 0, sizeof(obs_pair));
+    uint64_t rng = 0xfeedULL;
+    for (int i = 0; i < DRAWS; i++) {
+        const int t0 = ds4_test_speculative_point_sample(
+            logits0, N, D0, 1.0f, 0, 1.0f, 0.0f, &rng, probs);
+        CHECK(t0 >= 0 && t0 < N, "chained first draw %d", t0);
+        if (t0 < 0 || t0 >= N) continue;
+        if (t0 == D0) {
+            const int t1 = ds4_test_speculative_point_sample(
+                logits1, N, D1, 1.0f, 0, 1.0f, 0.0f, &rng, probs);
+            CHECK(t1 >= 0 && t1 < N, "chained second draw %d", t1);
+            if (t1 >= 0 && t1 < N) obs_pair[D0][t1] += 1.0;
+        } else {
+            obs_pair[t0][N] += 1.0;
+        }
+    }
+    double chi2 = 0.0;
+    uint32_t df = 0;
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j <= N; j++) {
+            const double e = exp_pair[i][j] * DRAWS;
+            if (e > 0.0) {
+                df++;
+                const double o = obs_pair[i][j];
+                chi2 += (o - e) * (o - e) / e;
+            } else {
+                CHECK(obs_pair[i][j] == 0.0,
+                      "chained: impossible outcome (%d,%d) seen %.0f times",
+                      i, j, obs_pair[i][j]);
+            }
+        }
+    }
+    if (df == 0) df = 1;
+    const double dfm1 = (double)(df - 1);
+    const double bound = dfm1 + 6.0 * sqrt(2.0 * dfm1);
+    CHECK(chi2 <= bound,
+          "chained: chi2 %.1f over %u df exceeds the 6-sigma bound %.1f",
+          chi2, df - 1, bound);
+    printf("  chained two-position: draws=%d df=%u chi2=%.1f bound=%.1f\n",
+           DRAWS, df - 1, chi2, bound);
+}
+
 int main(void) {
     check_speculative_distribution();
+    check_point_sample_distribution();
+    check_point_sample_chained();
     const uint32_t semantic_n = 4096;
     float *logits = malloc((size_t)semantic_n * sizeof(*logits));
     float *scratch = malloc((size_t)semantic_n * sizeof(*scratch));

@@ -142,6 +142,12 @@ typedef struct {
 
     uint64_t n_decode, n_verify, n_head, n_draft, n_read_logit;
 
+    /* The sampled leg's replay fixup: what commit_hyper_row was asked to
+     * write, recorded so the test can assert the row was the replay's own.
+     * commit_dst is -1 when no sampled round has replayed yet. */
+    uint64_t commit_calls;
+    int      commit_dst;
+    uint64_t commit_hidden;
     /* The two answers a rejecting round produces for the same position: the
      * batched verify's row-0 argmax, through the borrowed head, and the
      * one-row replay's.  Recorded here because the cycle does not report
@@ -579,6 +585,22 @@ static int ref_draft_rows(void *ctx, const int *next_tokens,
     return 0;
 }
 
+/*
+ * The sampled leg's replay fixup.  On the real session decode_token stages
+ * at hyper row 0 while the wrapper retains row n_committed - 1; here the
+ * "session tensor" is the refmodel itself, so the call is recorded and the
+ * test asserts the row that was uploaded is the hidden state after the
+ * committed prefix.  `commit_dst` is -1 when no call is outstanding.
+ */
+static int ref_commit_hyper_row(void *ctx, const float *hc_row,
+                                uint32_t dst_row) {
+    refmodel *m = ctx;
+    m->commit_calls++;
+    m->commit_dst = (int)dst_row;
+    m->commit_hidden = ref_hc_to_hidden(hc_row);
+    return 0;
+}
+
 static int g_ref_batched_draft = 1;
 
 static int ref_build(refmodel *m, ds4_qwen4exp_mtp_model *model,
@@ -594,6 +616,7 @@ static int ref_build(refmodel *m, ds4_qwen4exp_mtp_model *model,
     model->head_logits = ref_head_logits;
     model->draft_step = ref_draft_step;
     model->draft_rows = g_ref_batched_draft ? ref_draft_rows : NULL;
+    model->commit_hyper_row = ref_commit_hyper_row;
 
     ds4_qwen4exp_rollback_init(set);
     const struct { ds4_qwen4exp_state_id id; ds4_qwen4exp_rollback_object o; } objs[] = {
@@ -975,6 +998,551 @@ static int run_mtp(int first_token, int n, int *out, mtp_run *run,
     ds4_qwen4exp_mtp_state_free(&st);
     free(sm); free(ser_hidden); free(ser_next);
     return rc;
+}
+
+/* ========================================================================
+ * The sampled leg
+ * ======================================================================== */
+
+/* The test's own sampler, bound to the seam.  Plain temperature softmax over
+ * the whole reduced vocabulary; the truncation knobs are exercised against
+ * the production builder in tests/test_sampling.c, and what this leg checks
+ * is that the CYCLE composes accept/replace/replay exactly. */
+typedef struct {
+    float     temperature;
+    uint64_t  rng;
+} test_sampler_ctx;
+
+static uint64_t ts_rng_next(uint64_t *s) {
+    uint64_t x = *s;
+    if (x == 0) x = 0x9e3779b97f4a7c15ULL;
+    x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
+    *s = x;
+    return x * 0x2545f4914f6cdd1dULL;
+}
+
+static float ts_uniform(void *ctx) {
+    test_sampler_ctx *c = ctx;
+    return (float)((ts_rng_next(&c->rng) >> 40) & 0xffffffu) / 16777216.0f;
+}
+
+static bool ts_build_probs(void *ctx, const float *logits, uint32_t n_vocab,
+                           float *out) {
+    const test_sampler_ctx *c = ctx;
+    float mx = -INFINITY;
+    int best = 0;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        if (isfinite(logits[i]) && logits[i] > mx) {
+            mx = logits[i];
+            best = (int)i;
+        }
+    }
+    double sum = 0.0;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        out[i] = isfinite(logits[i])
+            ? expf((logits[i] - mx) / c->temperature) : 0.0f;
+        sum += out[i];
+    }
+    if (!(sum > 0.0) || !isfinite((float)sum)) {
+        for (uint32_t i = 0; i < n_vocab; i++) out[i] = 0.0f;
+        out[best] = 1.0f;
+        return true;
+    }
+    const float inv = (float)(1.0 / sum);
+    for (uint32_t i = 0; i < n_vocab; i++) out[i] *= inv;
+    return true;
+}
+
+static int ts_draw(void *ctx, const float *probs, uint32_t n_vocab) {
+    test_sampler_ctx *c = ctx;
+    double sum = 0.0;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        if (probs[i] > 0.0f && isfinite(probs[i])) sum += probs[i];
+    }
+    if (!(sum > 0.0)) {
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            if (probs[i] > 0.0f) return (int)i;
+        }
+        return -1;
+    }
+    float r = ts_uniform(ctx) * (float)sum;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float p = probs[i];
+        if (p <= 0.0f || !isfinite(p)) continue;
+        r -= p;
+        if (r <= 0.0f) return (int)i;
+    }
+    for (uint32_t i = n_vocab; i > 0; i--) {
+        if (probs[i - 1] > 0.0f) return (int)(i - 1);
+    }
+    return -1;
+}
+
+typedef struct {
+    uint64_t chain_rounds;   /* rounds that carried a pending chain in      */
+    uint64_t replay_checks;
+    uint64_t replaced_rounds;
+    uint64_t full_accepts;
+    int      faulted;
+    char     err[512];
+} mtp_sampled_run;
+
+/*
+ * The sampled leg, run the way the server drives it: the caller samples the
+ * fed token from the frontier logits each round, the cycle commits and the
+ * serial shadow replays the SAME tokens.  Unlike the greedy leg the emitted
+ * stream is not compared -- it legitimately differs from any serial run's --
+ * but every carried object still has to match the serial shadow's after each
+ * round, and commit_hyper_row has to have moved the replayed row into the
+ * committed frontier slot on every rejecting round.
+ */
+static int run_mtp_sampled(int first_token, int n, int depth,
+                           float temperature, uint64_t seed,
+                           mtp_sampled_run *run) {
+    refmodel m;
+    ds4_qwen4exp_mtp_model model;
+    ds4_qwen4exp_rollback_set set;
+    ds4_qwen4exp_mtp_state st;
+
+    memset(run, 0, sizeof(*run));
+    ref_reset(&m, BREAK_NONE, 0);
+    m.commit_dst = -1;
+    if (ref_build(&m, &model, &set) != 0) return -1;
+    if (ds4_qwen4exp_mtp_state_init(&st, depth, &set, REF_HC_DIM, REF_VOCAB,
+                                    run->err, sizeof(run->err)) != 0) {
+        run->faulted = 1;
+        return -1;
+    }
+    test_sampler_ctx sctx = { temperature, seed };
+    const ds4_qwen4exp_mtp_sampler sampler = {
+        &sctx, ts_build_probs, ts_uniform, ts_draw
+    };
+    float *probs = malloc(REF_VOCAB * sizeof(*probs));
+    float logits[REF_VOCAB];
+    int pending = first_token;
+    uint32_t pos = 0;
+    int produced = 0;
+    int rc = 0;
+
+    refmodel *sm = malloc(sizeof(*sm));
+    uint64_t *ser_hidden = malloc(REF_CAP * sizeof(*ser_hidden));
+    int *ser_next = malloc(REF_CAP * sizeof(*ser_next));
+    /* A head row folds the token it was written with.  Committed rows fold
+     * the committed token, but the FRONTIER row folds the chain's parent --
+     * the frontier argmax, not the sampled fed token.  Once committed, a row
+     * is never rewritten below head_len, so an argmax fold at a committed
+     * position is permanent and legitimate: fold_alt[q] remembers it. */
+    int *fold_alt = malloc(REF_CAP * sizeof(*fold_alt));
+    if (!sm || !ser_hidden || !ser_next || !probs || !fold_alt) {
+        snprintf(run->err, sizeof(run->err), "out of memory");
+        run->faulted = 1;
+        free(probs); free(sm); free(ser_hidden); free(ser_next);
+        free(fold_alt);
+        ds4_qwen4exp_mtp_state_free(&st);
+        return -1;
+    }
+    for (int i = 0; i < REF_CAP; i++) fold_alt[i] = -1;
+    ref_reset(sm, BREAK_NONE, 0);
+    int ser_fed = first_token;
+    uint32_t ser_pos = 0;
+
+    while (produced < n) {
+        int committed[DS4_QWEN4EXP_MTP_MAX_COMMIT];
+        const int budget = n - produced;
+        const uint64_t selects_before = m.selects;
+        const uint64_t commits_before = m.commit_calls;
+        const uint32_t pos_before = pos;
+        if (st.n_pending > 0) run->chain_rounds++;
+        refmodel *pre = malloc(sizeof(*pre));
+        if (!pre) {
+            snprintf(run->err, sizeof(run->err), "out of memory");
+            run->faulted = 1; rc = -1; break;
+        }
+        *pre = m;
+        const int got = ds4_qwen4exp_mtp_cycle_sampled(
+                &st, &model, &sampler, probs,
+                pending, pos, budget, committed,
+                DS4_QWEN4EXP_MTP_MAX_COMMIT, logits, run->err,
+                sizeof(run->err));
+        if (got < 0) {
+            if (m.faulted) {
+                snprintf(run->err, sizeof(run->err), "reference model: %s",
+                         m.fault);
+            }
+            run->faulted = 1;
+            rc = -1;
+            free(pre);
+            break;
+        }
+        if (got < 1 || got > budget || committed[0] != pending) {
+            snprintf(run->err, sizeof(run->err),
+                     "round committed %d first %d, expected the fed token %d "
+                     "within budget %d", got, committed[0], pending, budget);
+            run->faulted = 1; rc = -1; free(pre); break;
+        }
+        const int rejecting = selects_before != m.selects;
+        if (rejecting) run->replaced_rounds++;
+
+        /* commit_hyper_row: exactly one call on a rejecting round, none on a
+         * full accept or the one-row path; dst is the committed frontier row
+         * index and the row content is the replay's hidden state. */
+        const uint64_t want_calls = rejecting ? 1u : 0u;
+        if (m.commit_calls - commits_before != want_calls) {
+            snprintf(run->err, sizeof(run->err),
+                     "round %s but commit_hyper_row ran %llu times",
+                     rejecting ? "rejected" : "accepted",
+                     (unsigned long long)(m.commit_calls - commits_before));
+            run->faulted = 1; rc = -1; free(pre); break;
+        }
+        for (int i = 1; i < got; i++) produced++;
+        /* The caller's next fed token: a draw from the frontier row. */
+        ts_build_probs(&sctx, logits, REF_VOCAB, probs);
+        const int fed = pending;
+        pending = ts_draw(&sctx, probs, REF_VOCAB);
+        if (pending < 0) {
+            snprintf(run->err, sizeof(run->err), "sampler drew nothing");
+            run->faulted = 1; rc = -1; free(pre); break;
+        }
+        produced++;
+        pos += (uint32_t)got;
+
+        /* The rollback check: replay the committed tokens from the pre-round
+         * state on a slot-free model and compare every carried object. */
+        refmodel *replay = malloc(sizeof(*replay));
+        if (!replay) {
+            snprintf(run->err, sizeof(run->err), "out of memory");
+            run->faulted = 1; rc = -1; free(pre); break;
+        }
+        *replay = *pre;
+        int broke = 0;
+        for (int i = 0; i < got && !broke; i++) {
+            uint64_t h = 0;
+            if (ref_step(replay, committed[i], pos_before + (uint32_t)i,
+                         1u, &h) != 0) {
+                snprintf(run->err, sizeof(run->err),
+                         "replay fault: %s", replay->fault);
+                run->faulted = 1; rc = -1; broke = 1;
+            }
+        }
+        const char *rdiff = broke ? NULL : ref_carried_diff(&m, replay);
+        free(replay);
+        if (rdiff) {
+            snprintf(run->err, sizeof(run->err),
+                     "sampled round left %s differing from a replay of the "
+                     "%d committed token(s)", rdiff, got);
+            run->faulted = 1; rc = -1;
+        }
+        if (!broke && !rdiff) run->replay_checks++;
+        free(pre);
+        if (rc != 0) break;
+
+        /* The serial shadow walks the committed tokens; the head-cache check
+         * is the greedy leg's, against the tokens the leg actually took. */
+        float shc[REF_HC_DIM], slog[REF_VOCAB];
+        int broke2 = 0;
+        for (int i = 0; i < got && !broke2; i++) {
+            if (ref_decode_token(sm, ser_fed, ser_pos, shc, slog) != 0) {
+                snprintf(run->err, sizeof(run->err),
+                         "serial shadow fault: %s", sm->fault);
+                run->faulted = 1; rc = -1; broke2 = 1; break;
+            }
+            ser_hidden[ser_pos] = ref_hc_to_hidden(shc);
+            ser_fed = (i + 1 < got) ? committed[i + 1] : pending;
+            ser_next[ser_pos] = ser_fed;
+            ser_pos++;
+        }
+        if (broke2) break;
+        /* The replayed row commit_hyper_row moved is the hidden state after
+         * the committed prefix -- the shadow's last row. */
+        if (rejecting &&
+            (m.commit_dst != got - 1 ||
+             m.commit_hidden != ser_hidden[ser_pos - 1])) {
+            snprintf(run->err, sizeof(run->err),
+                     "commit_hyper_row wrote dst %d hidden %llu; the committed "
+                     "frontier is row %d hidden %llu",
+                     m.commit_dst, (unsigned long long)m.commit_hidden,
+                     got - 1,
+                     (unsigned long long)ser_hidden[ser_pos - 1]);
+            run->faulted = 1; rc = -1; break;
+        }
+        const char *diff = ref_carried_diff(&m, sm);
+        if (diff) {
+            snprintf(run->err, sizeof(run->err),
+                     "sampled round left the %s differing from the serial "
+                     "shadow after %u tokens", diff, ser_pos);
+            run->faulted = 1; rc = -1; break;
+        }
+        if (depth >= 1) {
+            /* The frontier row folds the chain's parent -- the frontier
+             * argmax, not the sampled fed token -- and a committed row is
+             * never rewritten below the head cursor, so an argmax fold at a
+             * committed position stays there legitimately.  Record it before
+             * provenance runs. */
+            if (st.n_pending > 0 && ser_pos > 0) {
+                fold_alt[ser_pos - 1] = st.pending_parent;
+            }
+            if (m.head_len < ser_pos) {
+                snprintf(run->err, sizeof(run->err),
+                         "the head cache covers %u rows at frontier %u",
+                         m.head_len, ser_pos);
+                run->faulted = 1; rc = -1; break;
+            }
+            for (uint32_t q = 0; q < ser_pos; q++) {
+                const uint64_t tok = (uint64_t)(uint32_t)ser_next[q];
+                const uint64_t from_target = mix64(ser_hidden[q] ^ tok);
+                const uint64_t from_chain =
+                    q > 0u ? mix64(m.head[q - 1u] ^ tok) : from_target;
+                const uint64_t from_alt =
+                    fold_alt[q] >= 0
+                        ? mix64(ser_hidden[q] ^
+                                (uint64_t)(uint32_t)fold_alt[q])
+                        : ~from_target;
+                if (!m.head_stamp[q] ||
+                    (m.head[q] != from_target && m.head[q] != from_chain &&
+                     m.head[q] != from_alt)) {
+                    snprintf(run->err, sizeof(run->err),
+                             "head cache row %u of %u came from neither the "
+                             "target's row, the head's own, nor the recorded "
+                             "argmax fold", q, ser_pos);
+                    run->faulted = 1; rc = -1;
+                    break;
+                }
+            }
+            if (rc != 0) break;
+        }
+        (void)fed;
+    }
+    run->full_accepts = st.counters.commit_hist[st.depth + 1];
+    if (rc == 0 &&
+        ds4_qwen4exp_mtp_counters_check(&st.counters, run->err,
+                                        sizeof(run->err)) != 0) {
+        run->faulted = 1;
+        rc = -1;
+    }
+    ds4_qwen4exp_mtp_state_free(&st);
+    free(probs); free(sm); free(ser_hidden); free(ser_next); free(fold_alt);
+    return rc;
+}
+
+static void test_exactness_sampled(void) {
+    enum { S_N_TOKENS = 256 };
+    static const int s_prompts[] = { 1, 7, 13, 29, 41, 58 };
+    printf("sampled: state equals the serial shadow over %d tokens, "
+           "depths 1 to 3\n", S_N_TOKENS);
+    for (int depth = 1; depth <= 3 && depth <= DS4_QWEN4EXP_IMPLEMENTED_DEPTH;
+         depth++) {
+        uint64_t chain_rounds = 0, replaced = 0, replays = 0;
+        for (int p = 0; p < 6; p++) {
+            mtp_sampled_run run;
+            if (run_mtp_sampled(s_prompts[p], S_N_TOKENS, depth,
+                                0.8f, 0x9d2c6b0381ULL + (uint64_t)p * 97u +
+                                (uint64_t)depth,
+                                &run) != 0) {
+                CHECK(0, "depth %d prompt %d: %s", depth, s_prompts[p],
+                      run.err);
+                continue;
+            }
+            chain_rounds += run.chain_rounds;
+            replaced += run.replaced_rounds;
+            replays += run.replay_checks;
+        }
+        CHECK(replays > 0, "depth %d: no replay checks ran", depth);
+        /* NON-VACUITY: with the frontier argmax as the chain's parent the
+         * sampled leg mostly re-seeds, but the oracle's argmax is still the
+         * most likely single draw at temp 0.8, so some chain rounds and some
+         * sampled replacements must happen across six prompts.  Zero means
+         * the verify/replay path never ran. */
+        CHECK(chain_rounds > 0,
+              "depth %d: no round carried a live chain", depth);
+        CHECK(replaced > 0,
+              "depth %d: no sampled rejection ever replayed", depth);
+        printf("  depth %d: %llu chained rounds, %llu replaced, %llu "
+               "replays\n", depth, (unsigned long long)chain_rounds,
+               (unsigned long long)replaced, (unsigned long long)replays);
+    }
+}
+
+/*
+ * THE DISTRIBUTION.  Freeze the model at a live chain (fed + two pending
+ * drafts into a 3-row verify) and enumerate the round's outcomes exactly:
+ *
+ *   (fed, d0, d1)  p0[d0] * p1[d1]                 full accept
+ *   (fed, d0, r1)  p0[d0] * p1[r1],  r1 != d1      reject at 1
+ *   (fed, r0)      p0[r0],             r0 != d0    reject at 0
+ *
+ * where p_j is the request distribution over verify row j -- the renormalized
+ * replacement draw p_j[r]/(1 - p_j[d_j]) times the rejection mass 1 - p_j[d_j]
+ * is exactly p_j[r].  200k restored rounds are chi-squared against that
+ * enumeration, and EVERY iteration replays its committed tokens so the state
+ * check runs at the same scale as the distribution check.
+ */
+static void test_sampled_distribution(void) {
+    printf("sampled distribution: exact enumeration vs 200k rounds\n");
+    for (int depth = 1; depth <= 2; depth++) {
+        /* Establish a live chain with one greedy round. */
+        refmodel m0;
+        ds4_qwen4exp_mtp_model model;
+        ds4_qwen4exp_rollback_set set;
+        ds4_qwen4exp_mtp_state st0;
+        ref_reset(&m0, BREAK_NONE, 0);
+        m0.commit_dst = -1;
+        CHECK(ref_build(&m0, &model, &set) == 0, "ref build");
+        CHECK(ds4_qwen4exp_mtp_state_init(&st0, depth, &set, REF_HC_DIM,
+                                        REF_VOCAB, g_err, sizeof(g_err)) == 0,
+              "state init: %s", g_err);
+        float logits0[REF_VOCAB];
+        int committed0[DS4_QWEN4EXP_MTP_MAX_COMMIT];
+        const int warm = ds4_qwen4exp_mtp_cycle(
+                &st0, &model, depth == 1 ? 7 : 29, 0u, 64, committed0,
+                DS4_QWEN4EXP_MTP_MAX_COMMIT, logits0, g_err, sizeof(g_err));
+        CHECK(warm > 0, "warmup round failed: %s", g_err);
+        if (warm <= 0) { ds4_qwen4exp_mtp_state_free(&st0); continue; }
+        CHECK(st0.n_pending == depth,
+              "depth %d warmup left %d pending, expected %d",
+              depth, st0.n_pending, depth);
+        if (st0.n_pending != depth) {
+            ds4_qwen4exp_mtp_state_free(&st0);
+            continue;
+        }
+        const uint32_t pos = (uint32_t)warm;
+        const int fed = st0.pending_parent;
+
+        /* The per-row request distributions for the round that follows, from
+         * a probe copy of the state (the verify mutates the model). */
+        float row_logits[DS4_QWEN4EXP_MTP_MAX_COMMIT][REF_VOCAB];
+        {
+            refmodel probe = m0;
+            int toks[DS4_QWEN4EXP_MTP_MAX_COMMIT];
+            float hc_probe[DS4_QWEN4EXP_MTP_MAX_COMMIT * REF_HC_DIM];
+            toks[0] = fed;
+            for (int k = 0; k < depth; k++) toks[k + 1] = st0.pending[k];
+            CHECK(ref_verify_rows(&probe, toks, (uint32_t)depth + 1u, pos,
+                                  hc_probe, &row_logits[0][0]) == 0,
+                  "probe verify");
+        }
+        float prow[DS4_QWEN4EXP_MTP_MAX_COMMIT][REF_VOCAB];
+        test_sampler_ctx ectx = { 1.0f, 1 };
+        for (int j = 0; j <= depth; j++) {
+            ts_build_probs(&ectx, row_logits[j], REF_VOCAB, prow[j]);
+        }
+
+        /* Bucket key: commit_len * REF_VOCAB + last committed token.  The
+         * middle tokens are fixed (accepted drafts), so (len, last) is the
+         * complete outcome. */
+        double expect[(DS4_QWEN4EXP_MTP_MAX_COMMIT + 1) * REF_VOCAB];
+        memset(expect, 0, sizeof(expect));
+        const double pd0 = prow[0][st0.pending[0]];
+        if (depth == 1) {
+            for (uint32_t v = 0; v < REF_VOCAB; v++) {
+                expect[2 * REF_VOCAB + v] = prow[0][v];
+            }
+        } else {
+            const double pd1 = prow[1][st0.pending[1]];
+            for (uint32_t v = 0; v < REF_VOCAB; v++) {
+                if ((int)v != st0.pending[0]) {
+                    expect[2 * REF_VOCAB + v] = prow[0][v];
+                }
+            }
+            expect[3 * REF_VOCAB + st0.pending[1]] = pd0 * pd1;
+            for (uint32_t v = 0; v < REF_VOCAB; v++) {
+                if ((int)v != st0.pending[1]) {
+                    expect[3 * REF_VOCAB + v] = pd0 * prow[1][v];
+                }
+            }
+        }
+
+        double *obs = calloc((DS4_QWEN4EXP_MTP_MAX_COMMIT + 1) * REF_VOCAB,
+                             sizeof(*obs));
+        ds4_qwen4exp_mtp_state *stc = malloc(sizeof(*stc));
+        CHECK(obs && stc, "distribution scratch");
+        if (!obs || !stc) { free(obs); free(stc);
+            ds4_qwen4exp_mtp_state_free(&st0); continue; }
+
+        const int DRAWS = 200000;
+        uint64_t reject_rounds = 0;
+        uint64_t rng0 = 0x45f17a9dULL + (uint64_t)depth * 7919u;
+        for (int i = 0; i < DRAWS; i++) {
+            refmodel m = m0;
+            *stc = st0;
+            /* The snapshot's rollback set points at m0; rebind every object
+             * to THIS iteration's model so select/truncate act on the state
+             * the verify just wrote. */
+            ds4_qwen4exp_rollback_set siter = set;
+            for (int k = 0; k < DS4_QWEN4EXP_STATE_COUNT; k++)
+                siter.obj[k].ctx = &m;
+            stc->rollback = &siter;
+            model.ctx = &m;   /* this iteration's state, not the snapshot's */
+            test_sampler_ctx cctx = { 1.0f, rng0 + (uint64_t)i * 0x9e3779b9ULL };
+            const ds4_qwen4exp_mtp_sampler sampler = {
+                &cctx, ts_build_probs, ts_uniform, ts_draw
+            };
+            float probs[REF_VOCAB];
+            float flogits[REF_VOCAB];
+            int committed[DS4_QWEN4EXP_MTP_MAX_COMMIT];
+            const uint64_t sel_before = m.selects;
+            const int got = ds4_qwen4exp_mtp_cycle_sampled(
+                    stc, &model, &sampler, probs, fed, pos, 64, committed,
+                    DS4_QWEN4EXP_MTP_MAX_COMMIT, flogits,
+                    g_err, sizeof(g_err));
+            if (got < 1) {
+                CHECK(0, "depth %d draw %d failed: %s%s", depth, i, g_err,
+                      m.faulted ? m.fault : "");
+                break;
+            }
+            if (m.selects != sel_before) reject_rounds++;
+            const int key = got * (int)REF_VOCAB + committed[got - 1];
+            obs[key] += 1.0;
+            /* Every iteration, the replay check: the state after the round is
+             * the state the committed tokens leave. */
+            refmodel replay = m0;
+            int ok_replay = 1;
+            for (int t = 0; t < got; t++) {
+                uint64_t h = 0;
+                if (ref_step(&replay, committed[t], pos + (uint32_t)t,
+                             1u, &h) != 0) { ok_replay = 0; break; }
+            }
+            if (ok_replay) {
+                const char *d = ref_carried_diff(&m, &replay);
+                CHECK(d == NULL,
+                      "depth %d draw %d: %s differs after sampled round",
+                      depth, i, d ? d : "?");
+            } else {
+                CHECK(0, "depth %d draw %d: replay fault", depth, i);
+            }
+        }
+
+        double chi2 = 0.0;
+        uint32_t df = 0;
+        double tv = 0.0;
+        for (size_t b = 0;
+             b < (size_t)(DS4_QWEN4EXP_MTP_MAX_COMMIT + 1) * REF_VOCAB; b++) {
+            const double e = expect[b] * DRAWS;
+            if (e > 0.0) {
+                df++;
+                const double o = obs[b];
+                chi2 += (o - e) * (o - e) / e;
+            } else {
+                CHECK(obs[b] == 0.0,
+                      "depth %d: impossible outcome bucket %zu hit %.0f",
+                      depth, b, obs[b]);
+            }
+            tv += fabs(obs[b] / DRAWS - expect[b]);
+        }
+        tv *= 0.5;
+        if (df == 0) df = 1;
+        const double dfm1 = (double)(df - 1);
+        const double bound = dfm1 + 6.0 * sqrt(2.0 * dfm1);
+        CHECK(chi2 <= bound,
+              "depth %d: chi2 %.1f over %u df exceeds the 6-sigma bound %.1f "
+              "(TV %.5f)", depth, chi2, df - 1, bound, tv);
+        CHECK(reject_rounds > 0,
+              "depth %d: no rejecting round in %d draws", depth, DRAWS);
+        printf("  depth %d: draws=%d df=%u chi2=%.1f bound=%.1f TV=%.5f "
+               "rejects=%llu\n", depth, DRAWS, df - 1, chi2, bound, tv,
+               (unsigned long long)reject_rounds);
+        free(obs); free(stc);
+        ds4_qwen4exp_mtp_state_free(&st0);
+    }
 }
 
 /* ========================================================================
@@ -2576,6 +3144,10 @@ int main(void) {
     test_budget();
     printf("\n");
     test_deferred_frontier_logits();
+    test_exactness_sampled();
+    printf("\n");
+    test_sampled_distribution();
+    printf("\n");
     printf("\n");
     test_head_wiring();
     printf("\n");

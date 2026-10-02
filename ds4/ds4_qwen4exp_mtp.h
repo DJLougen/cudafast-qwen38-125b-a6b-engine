@@ -415,7 +415,41 @@ typedef struct {
      * NULL: no margins, and no chain is ever gated.
      */
     float (*draft_margin)(void *ctx);
+
+    /*
+     * OPTIONAL for the greedy cycle, REQUIRED by the sampled one: upload one
+     * host hc row over session hyper row `dst_row`.
+     *
+     * The sampled cycle's rejection replay runs decode_token, which stages its
+     * hyper at session row 0 -- but the wrapper retains session row
+     * n_committed - 1 as the next round's cache tail, and that row still holds
+     * the rejected draft's hidden state until this call writes the replay's
+     * row over it.  Greedy never replays, so it never calls this.
+     */
+    int (*commit_hyper_row)(void *ctx, const float *hc_row,
+                            uint32_t dst_row);
 } ds4_qwen4exp_mtp_model;
+
+/*
+ * The request's sampler, as a seam.  The sampled cycle needs three verbs and
+ * nothing else: the target row's truncated distribution, one uniform, and a
+ * draw from a probability vector.  ds4.c binds these to
+ * sample_build_probabilities / sample_rng_f32 / sample_probabilities so the
+ * cycle's accept and replacement draws are the serial sampler's own math.
+ *
+ * `build_probs` writes the normalized, temperature/top_k/top_p/min_p-
+ * truncated distribution over `logits` into `probs_out` (n_vocab floats).
+ * `draw` returns a token id from a probability vector that need not sum to
+ * one exactly.  `uniform` returns a draw in [0, 1).  All three are required
+ * for the sampled cycle; a NULL callback is refused by name at the call.
+ */
+typedef struct {
+    void *ctx;
+    bool (*build_probs)(void *ctx, const float *logits, uint32_t n_vocab,
+                        float *probs_out);
+    float (*uniform)(void *ctx);
+    int (*draw)(void *ctx, const float *probs, uint32_t n_vocab);
+} ds4_qwen4exp_mtp_sampler;
 
 /* ------------------------------------------------------------------------
  * Counters and state
@@ -438,6 +472,11 @@ typedef struct {
      * before there was a depth to tell them apart. */
     uint64_t drafted;
     uint64_t accepted;  /* draft TOKENS the target's own argmax confirmed    */
+    /* Rejecting rounds on the SAMPLED cycle: each one commits a replacement
+     * token on top of the fed token and the accepted prefix, so
+     * committed == rounds + accepted + replaced.  Always 0 on the greedy
+     * cycle, where the round ends at the rejected position instead. */
+    uint64_t replaced;
     uint64_t committed; /* tokens committed, the fed token included          */
     uint64_t quenches;  /* always 0: no yield guard on this path             */
     /*
@@ -606,6 +645,47 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
  * in it, which is what the caller samples its next fed token from.  A caller
  * that passes its own frontier buffer needs to do nothing else; one that passes
  * NULL is refused by name rather than left sampling a stale distribution. */
+
+/*
+ * The SAMPLED cycle: exact speculative sampling over the same draft chain.
+ *
+ * Drafts are point proposals -- the head's argmaxes, taken as-is rather than
+ * as the target's answer.  At each verify position j the draft stands with
+ * probability p_j(d_j), where p_j is the request's distribution (the
+ * sampler's build_probs over row j), decided by one `uniform` draw.  The
+ * first rejection commits the accepted prefix plus a REPLACEMENT drawn from
+ * p_j with the rejected draft removed and the row renormalized, replays that
+ * replacement through a one-row decode so every carried object lands exactly
+ * where a serial leg's would, and ends the round.  A round that accepts
+ * everything commits n + 1 tokens and leaves the caller to sample the bonus
+ * from the frontier row, exactly as the greedy cycle does.
+ *
+ * This is the point-mass limit of p/q speculative sampling: with q a delta on
+ * d_j the textbook accept ratio min(1, p/q) is p_j(d_j), and the rejection
+ * correction max(0, p - q) is p_j with d_j removed.  The emitted stream is
+ * therefore distributed exactly as the serial sampler's at any depth, for
+ * any RNG the sampler seam supplies -- the draws differ from the serial
+ * leg's, only the distribution does not.
+ *
+ * Requires the FULL verify (model->verify_rows): the truncated distribution
+ * needs every row's complete logits, so the compact top-1 seam is never
+ * consulted and a caller that armed DS4_QWEN4EXP_TARGET_NATIVE_SCREEN must
+ * not reach here.  Requires model->commit_hyper_row for the replay's session
+ * fixup and `sampler` with all three callbacks.  `probs` is n_vocab floats of
+ * scratch the caller owns (s->sample_probs in ds4.c).
+ *
+ * `logits`, `accepted`, `budget`, `pos` and the return value mean exactly
+ * what they mean for ds4_qwen4exp_mtp_cycle.
+ */
+int ds4_qwen4exp_mtp_cycle_sampled(ds4_qwen4exp_mtp_state *st,
+                                   const ds4_qwen4exp_mtp_model *model,
+                                   const ds4_qwen4exp_mtp_sampler *sampler,
+                                   float *probs,
+                                   int first_token,
+                                   uint32_t pos, int budget,
+                                   int *accepted, int accepted_cap,
+                                   float *logits,
+                                   char *err, size_t errlen);
 
 /* ------------------------------------------------------------------------
  * The head

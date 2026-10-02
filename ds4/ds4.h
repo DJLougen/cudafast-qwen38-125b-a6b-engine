@@ -480,6 +480,15 @@ int ds4_test_speculative_delta_sample(const float *target_logits,
                                       float min_p,
                                       uint64_t *rng,
                                       float *target_probs);
+int ds4_test_speculative_point_sample(const float *target_logits,
+                                      uint32_t n_vocab,
+                                      int draft_token,
+                                      float temperature,
+                                      int top_k,
+                                      float top_p,
+                                      float min_p,
+                                      uint64_t *rng,
+                                      float *target_probs);
 int ds4_test_argmax_excluding_logits(const float *logits, uint32_t n_vocab,
                                      int excluded_id);
 uint64_t ds4_test_mixed_native_count(void);

@@ -10,6 +10,7 @@
 #include "ds4_qwen4exp_mtp.h"
 
 #include <errno.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -377,16 +378,28 @@ int ds4_qwen4exp_mtp_counters_check(const ds4_qwen4exp_mtp_counters *c,
                         (unsigned long long)c->verify_replay_disagreements,
                         (unsigned long long)(c->drafted - c->accepted));
     }
-    /* Every round commits the fed token, and every accepted draft adds exactly
-     * one more.  At depth 1 this was "accepted == commit_hist[2]"; the sum
-     * form is the same statement at any depth. */
-    if (c->committed != c->rounds + c->accepted) {
+    /* Every round commits the fed token, every accepted draft adds one more,
+     * and every rejecting SAMPLED round adds its replacement.  At depth 1
+     * this was "accepted == commit_hist[2]"; the sum form is the same
+     * statement at any depth, and `replaced` stays 0 wherever sampling never
+     * ran. */
+    if (c->replaced > c->rounds) {
         return mtp_fail(err, errlen,
-                        "qwen4exp MTP counters: %llu rounds and %llu accepted "
-                        "drafts should commit %llu tokens, not %llu",
+                        "qwen4exp MTP counters: %llu replacement commits over "
+                        "%llu rounds",
+                        (unsigned long long)c->replaced,
+                        (unsigned long long)c->rounds);
+    }
+    if (c->committed != c->rounds + c->accepted + c->replaced) {
+        return mtp_fail(err, errlen,
+                        "qwen4exp MTP counters: %llu rounds, %llu accepted "
+                        "drafts and %llu replacements should commit %llu "
+                        "tokens, not %llu",
                         (unsigned long long)c->rounds,
                         (unsigned long long)c->accepted,
-                        (unsigned long long)(c->rounds + c->accepted),
+                        (unsigned long long)c->replaced,
+                        (unsigned long long)(c->rounds + c->accepted +
+                                             c->replaced),
                         (unsigned long long)c->committed);
     }
     if (c->quenches != 0) {
@@ -823,6 +836,284 @@ int ds4_qwen4exp_mtp_cycle(ds4_qwen4exp_mtp_state *st,
         mtp_token_log(accepted, a + 1);
     }
     return a + 1;
+}
+
+/*
+ * The sampled leg.  Identical round framing to ds4_qwen4exp_mtp_cycle --
+ * same chain carry, same margin gate, same rollback machinery -- with two
+ * differences: the accept test is stochastic (the request distribution's
+ * mass on the drafted token against one uniform draw, the point-mass limit
+ * of min(1, p/q)), and a rejecting round commits a REPLACEMENT drawn from
+ * the row's distribution with the rejected draft removed, replayed through
+ * decode_token so the adopted state equals a serial feed's exactly.
+ *
+ * The verify is the FULL one: the truncated distribution needs every row's
+ * complete logits, so verify_rows_top1/read_logit_row/defer_frontier_logits
+ * are never consulted.  Greedy is untouched by everything here.
+ */
+int ds4_qwen4exp_mtp_cycle_sampled(ds4_qwen4exp_mtp_state *st,
+                                   const ds4_qwen4exp_mtp_model *model,
+                                   const ds4_qwen4exp_mtp_sampler *sampler,
+                                   float *probs,
+                                   int first_token,
+                                   uint32_t pos, int budget,
+                                   int *accepted, int accepted_cap,
+                                   float *logits,
+                                   char *err, size_t errlen) {
+    if (!st->hc_scratch || !st->logits_rows) {
+        return mtp_fail(err, errlen, "qwen4exp MTP: state is not initialised");
+    }
+    /* Same contract as the greedy leg: the frontier distribution is an
+     * out-parameter, so a missing buffer is a caller that would repeat one
+     * token for ever. */
+    if (!logits) {
+        return mtp_fail(err, errlen,
+                        "qwen4exp MTP: the sampled cycle was given no logit "
+                        "buffer to leave the frontier distribution in");
+    }
+    if (!sampler || !sampler->build_probs || !sampler->uniform ||
+        !sampler->draw) {
+        return mtp_fail(err, errlen,
+                        "qwen4exp MTP: the sampled cycle needs a sampler with "
+                        "build_probs, uniform and draw");
+    }
+    if (!probs) {
+        return mtp_fail(err, errlen,
+                        "qwen4exp MTP: the sampled cycle needs a probability "
+                        "scratch of n_vocab floats");
+    }
+    if (!model->verify_rows || !model->decode_token ||
+        !model->commit_hyper_row) {
+        /* commit_hyper_row is the replay's session fixup: the one-row decode
+         * stages at session hyper row 0 while the wrapper retains row
+         * n_committed - 1, so without the write the retained row is the
+         * rejected draft's hidden state.  Refuse the cycle by name rather
+         * than speculate with a poisoned tail. */
+        return mtp_fail(err, errlen,
+                        "qwen4exp MTP: the sampled cycle needs the full "
+                        "verify, decode_token and commit_hyper_row");
+    }
+    if (accepted_cap < 1 || budget < 1) {
+        return mtp_fail(err, errlen,
+                        "qwen4exp MTP: budget %d and capacity %d leave no room "
+                        "for the fed token", budget, accepted_cap);
+    }
+    if (model->hc_dim != st->hc_dim || model->n_vocab != st->n_vocab) {
+        return mtp_fail(err, errlen,
+                        "qwen4exp MTP: the model reports hc_dim %u vocab %u, "
+                        "the state was built for hc_dim %u vocab %u",
+                        model->hc_dim, model->n_vocab, st->hc_dim, st->n_vocab);
+    }
+    st->counters.rounds += 1;
+    st->frontier_top1_valid = false;
+    st->frontier_logits_deferred = false;
+
+    /* Same chain contract as greedy: a fed token other than the one the chain
+     * was drafted from makes the whole chain stale.  On a sampled leg that
+     * includes every fed token that is not the frontier's argmax -- the
+     * limitation documented for this cycle -- and the round falls back to
+     * the one-row decode and re-seed. */
+    if (st->n_pending > 0 && first_token != st->pending_parent) {
+        ds4_qwen4exp_mtp_invalidate(st);
+    }
+    int n = st->n_pending;
+    if (n > budget - 1) n = budget - 1;
+    /* The same bound as greedy: a full accept commits n + 1 and a reject at
+     * row a commits a + 2 <= n + 1, so n <= accepted_cap - 1 covers both. */
+    if (n > accepted_cap - 1) n = accepted_cap - 1;
+    const int n_offered = n > 0 ? n : 0;
+    float offered_margin[DS4_QWEN4EXP_IMPLEMENTED_DEPTH];
+    for (int k = 0; k < n_offered; k++) offered_margin[k] = st->pending_margin[k];
+    const uint64_t log_verify0 = st->counters.verify_ns;
+    const uint64_t log_draft0 = st->counters.draft_ns;
+    if (st->drop_margin > 0.0f) {
+        while (n > st->drop_keep && offered_margin[n - 1] >= 0.0f &&
+               offered_margin[n - 1] < st->drop_margin) {
+            n--;
+        }
+    }
+    if (n < 1 || st->depth < 1) {
+        const int rc = mtp_commit_one(st, model, first_token, pos,
+                                      accepted, logits, NULL, err, errlen);
+        if (rc > 0) {
+            if (st->margin_log) {
+                mtp_margin_log(st, n_offered, 0, 0, offered_margin,
+                               log_verify0, log_draft0);
+            }
+            if (getenv("DS4_MTP_TOKEN_LOG") != NULL) {
+                mtp_token_log(accepted, rc);
+            }
+        }
+        return rc;
+    }
+
+    const ds4_qwen4exp_rollback_set *rollback = st->rollback;
+    int toks[DS4_QWEN4EXP_MTP_MAX_COMMIT];
+    _Static_assert(DS4_QWEN4EXP_MTP_MAX_COMMIT ==
+                           DS4_QWEN4EXP_IMPLEMENTED_DEPTH + 1,
+                   "the verify carries the fed token plus the whole chain");
+    toks[0] = first_token;
+    for (int k = 0; k < n; k++) toks[k + 1] = st->pending[k];
+    ds4_qwen4exp_mtp_invalidate(st);
+
+    float *const hc = st->hc_scratch;
+    float *const row_logits = st->logits_rows;
+    st->counters.drafted += (uint64_t)n;
+    const uint64_t verify_t0 = mtp_now_ns();
+    const int vrc = model->verify_rows(model->ctx, toks, (uint32_t)n + 1u,
+                                       pos, hc, row_logits);
+    st->counters.verify_ns += mtp_now_ns() - verify_t0;
+    if (vrc != 0) {
+        return mtp_fail(err, errlen,
+                        "qwen4exp MTP: %d-row sampled verify at position %u "
+                        "failed", n + 1, pos);
+    }
+
+    /*
+     * The longest accepted prefix under the point-mass rule.  Row j's
+     * distribution p_j is the request's sampler applied to the verify's
+     * full logits, and draft j stands iff one uniform draw lands under
+     * p_j(d_j).  A row after a rejection is conditioned on a prefix the
+     * stream never had, so the scan stops at the first miss exactly as the
+     * greedy one does.  p_j(d_j) <= 0 or non-finite is a rejection and the
+     * replacement comes from the rest of the row.
+     */
+    int a = 0;
+    int replacement = -1;
+    while (a < n) {
+        if (!sampler->build_probs(sampler->ctx,
+                                  row_logits + (size_t)a * st->n_vocab,
+                                  st->n_vocab, probs)) {
+            return mtp_fail(err, errlen,
+                            "qwen4exp MTP: sampled verify row %d has no "
+                            "distribution", a);
+        }
+        const float pd = probs[toks[a + 1]];
+        if (!(pd > 0.0f) || !isfinite(pd)) {
+            replacement = sampler->draw(sampler->ctx, probs, st->n_vocab);
+            if (replacement < 0) {
+                return mtp_fail(err, errlen,
+                                "qwen4exp MTP: the sampler drew no "
+                                "replacement at row %d", a);
+            }
+            break;
+        }
+        if (sampler->uniform(sampler->ctx) <= pd) {
+            a++;
+            continue;
+        }
+        probs[toks[a + 1]] = 0.0f;
+        replacement = sampler->draw(sampler->ctx, probs, st->n_vocab);
+        if (replacement < 0) {
+            return mtp_fail(err, errlen,
+                            "qwen4exp MTP: the sampler drew no replacement "
+                            "at row %d", a);
+        }
+        break;
+    }
+    st->counters.accepted += (uint64_t)a;
+
+    if (a == n) {
+        /* Whole chain accepted: every row is committed and the frontier is
+         * row n's distribution, which the caller samples the bonus from --
+         * the same shape as the greedy full accept. */
+        memcpy(logits, row_logits + (size_t)a * st->n_vocab,
+               (size_t)st->n_vocab * sizeof(float));
+        for (int k = 0; k <= n; k++) accepted[k] = toks[k];
+        st->counters.committed += (uint64_t)(n + 1);
+        st->counters.commit_hist[n + 1] += 1;
+        const int next_fed = ds4_qwen4exp_mtp_argmax(logits, st->n_vocab);
+        if (mtp_draft_chain(st, model, hc, toks, n, pos, next_fed,
+                            err, errlen) != 0) {
+            return -1;
+        }
+        if (st->margin_log) {
+            mtp_margin_log(st, n_offered, n, a, offered_margin,
+                           log_verify0, log_draft0);
+        }
+        if (getenv("DS4_MTP_TOKEN_LOG") != NULL) {
+            mtp_token_log(accepted, n + 1);
+        }
+        return n + 1;
+    }
+
+    /*
+     * Reject at row `a`.  Commit the accepted prefix PLUS the replacement:
+     * unlike the greedy leg the rejected position has an answer of its own,
+     * drawn from p_a with the draft removed, so the round commits a + 2
+     * tokens.  The rollback lands the state after row a, the one-row replay
+     * of the replacement extends it through the committed position, and
+     * `logits` leaves the distribution AFTER the replacement, which is what
+     * the caller samples next from.
+     */
+    const uint64_t rb_t0 = mtp_now_ns();
+    const int srrc = rollback_select_row(rollback, (uint32_t)a, err, errlen);
+    const int trrc = srrc == 0
+        ? rollback_truncate_all(rollback, pos + (uint32_t)a + 1u, err, errlen)
+        : 0;
+    st->counters.rollback_ns += mtp_now_ns() - rb_t0;
+    if (srrc != 0 || trrc != 0) return -1;
+
+    float *const replay_hc = hc + (size_t)(a + 1) * st->hc_dim;
+    const uint64_t rep_t0 = mtp_now_ns();
+    const int drc = model->decode_token(model->ctx, replacement,
+                                        pos + (uint32_t)a + 1u,
+                                        replay_hc, logits);
+    st->counters.verify_ns += mtp_now_ns() - rep_t0;
+    if (drc != 0) {
+        return mtp_fail(err, errlen,
+                        "qwen4exp MTP: replay of sampled replacement %d at "
+                        "position %u failed", replacement,
+                        pos + (uint32_t)a + 1u);
+    }
+    /* decode_token staged its hyper at session row 0; the frontier row the
+     * wrapper retains is n_committed - 1 = a + 1.  Write the replay's row
+     * over it BEFORE returning or the retained tail is the rejected draft's
+     * hidden state. */
+    if (model->commit_hyper_row(model->ctx, replay_hc, (uint32_t)(a + 1))
+            != 0) {
+        return mtp_fail(err, errlen,
+                        "qwen4exp MTP: commit of the replayed hyper row %d "
+                        "failed", a + 1);
+    }
+
+    toks[a + 1] = replacement;
+    for (int k = 0; k <= a + 1; k++) accepted[k] = toks[k];
+    st->counters.committed += (uint64_t)(a + 2);
+    st->counters.replaced += 1;
+    st->counters.commit_hist[a + 2] += 1;
+    /* The head row at pos + a survived the round's truncates but folds the
+     * REJECTED draft over the chain's own previous row -- and the seed range
+     * below `start` is empty because the cursor says it is already written.
+     * Rewind the cache one row further so the seed rewrites it with the
+     * replacement over the target's row: a committed position must fold the
+     * committed token.  The greedy leg never commits a replacement, which is
+     * why only this leg pays for the extra truncate. */
+    if (mtp_head_cache_truncate(rollback, pos + (uint32_t)a,
+                                err, errlen) != 0) {
+        return -1;
+    }
+    if (st->head_rows > pos + (uint32_t)a) {
+        st->head_rows = pos + (uint32_t)a;
+    }
+    /* The chain seeds over the committed rows, so it sees toks[a+1] = the
+     * replacement and hc[a+1] = the replay's row; rows past a + 1 are never
+     * read.  Its pending_parent is the frontier argmax as on the greedy leg:
+     * a sampled fed token that differs re-seeds the chain next round, the
+     * documented limitation of this design. */
+    const int next_fed = ds4_qwen4exp_mtp_argmax(logits, st->n_vocab);
+    if (mtp_draft_chain(st, model, hc, toks, a + 1, pos, next_fed,
+                        err, errlen) != 0) {
+        return -1;
+    }
+    if (st->margin_log) {
+        mtp_margin_log(st, n_offered, n, a, offered_margin,
+                       log_verify0, log_draft0);
+    }
+    if (getenv("DS4_MTP_TOKEN_LOG") != NULL) {
+        mtp_token_log(accepted, a + 2);
+    }
+    return a + 2;
 }
 
 /* ------------------------------------------------------------------------

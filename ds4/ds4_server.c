@@ -968,11 +968,11 @@ static bool parse_ignore_eos_value(const char **p, request *r) {
 
 static bool request_validate_ignore_eos(const request *r,
                                         char *err, size_t errlen) {
-    if (!r || !r->ignore_eos) return true;
-    if (r->temperature_set && r->temperature == 0.0f) return true;
-    snprintf(err, errlen,
-             "ignore_eos requires an explicit temperature of 0");
-    return false;
+    (void)r; (void)err; (void)errlen;
+    /* ignore_eos only suppresses the EOS stop; the request's temperature
+     * still decides greedy against sampled, so any temperature is valid.
+     * (temperature 0 + ignore_eos remains the benchmark's greedy shape.) */
+    return true;
 }
 
 static void request_free(request *r) {
@@ -13107,7 +13107,11 @@ decode_again:
             temperature = 0.0f;
         }
         const int eos_token = ds4_token_eos(s->engine);
-        int token = j->req.ignore_eos ?
+        /* ignore_eos suppresses the EOS stop only: temperature 0 still takes
+         * the argmax-ignoring-eos pick, and a positive temperature samples
+         * exactly as without it -- the sampled token may be EOS, which is
+         * then committed like any other token. */
+        int token = (j->req.ignore_eos && temperature <= 0.0f) ?
             ds4_session_argmax_ignoring_eos(slot->session,
                                             j->req.think_mode) :
             ds4_session_sample(slot->session, temperature, top_k,
@@ -13117,7 +13121,8 @@ decode_again:
             snprintf(err, sizeof(err), "failed to select a non-EOS token");
             break;
         }
-        if (ds4_token_is_stop_for_think_mode(s->engine,
+        if (!j->req.ignore_eos &&
+            ds4_token_is_stop_for_think_mode(s->engine,
                                              token,
                                              j->req.think_mode)) {
             finish = "stop";
@@ -13126,18 +13131,20 @@ decode_again:
 
         int toks[17];
         int ntok = 0;
-        /* qwen4exp MTP commits the target's greedy argmax only (see
-         * ds4_session_eval_speculative), so a sampled request -- including
-         * one that omits temperature and gets DS4_DEFAULT_TEMPERATURE --
-         * decodes serially, exactly as without --mtp-model.  ignore_eos
-         * requests are greedy regardless of temperature. */
-        const bool spec_greedy_only = ds4_engine_is_qwen4exp(s->engine);
+        /* qwen4exp MTP: greedy commits the target's argmax (bit-identical to
+         * serial) and sampled requests take the exact point-mass cycle in
+         * ds4_session_eval_speculative.  DS4_QWEN4EXP_NO_SPEC_SAMPLING is the
+         * kill switch restoring serial sampled decode; ignore_eos requests
+         * are greedy regardless of temperature. */
+        const bool spec_greedy_only =
+            ds4_engine_is_qwen4exp(s->engine) &&
+            getenv("DS4_QWEN4EXP_NO_SPEC_SAMPLING") != NULL;
         if (!s->batched_mode &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             (!spec_greedy_only || j->req.ignore_eos || temperature <= 0.0f) &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
-            if (j->req.ignore_eos) {
+            if (j->req.ignore_eos && temperature <= 0.0f) {
                 ntok = ds4_session_eval_speculative_argmax_ignoring_eos(
                     slot->session, token, max_tokens - completion,
                     eos_token, j->req.think_mode,
@@ -13170,7 +13177,10 @@ decode_again:
                 break;
             }
             token = toks[ti];
-            if (ds4_token_is_stop_for_think_mode(s->engine,
+            /* ignore_eos: EOS is an ordinary token now -- sampled requests can
+             * land on it, and it is committed and emitted like any other. */
+            if (!j->req.ignore_eos &&
+                ds4_token_is_stop_for_think_mode(s->engine,
                                                  token,
                                                  j->req.think_mode)) {
                 finish = "stop";
@@ -16504,8 +16514,9 @@ static void test_chat_ignore_eos_contract(void) {
     TEST_ASSERT(parse_ignore_eos_value(&p, &r));
     TEST_ASSERT(r.ignore_eos);
     TEST_ASSERT(*p == '\0');
-    TEST_ASSERT(!request_validate_ignore_eos(&r, err, sizeof(err)));
-    TEST_ASSERT(strstr(err, "temperature") != NULL);
+    /* Any temperature is valid now: ignore_eos suppresses only the EOS stop,
+     * and the temperature still decides greedy against sampled. */
+    TEST_ASSERT(request_validate_ignore_eos(&r, err, sizeof(err)));
 
     r.temperature_set = true;
     r.temperature = 0.0f;
@@ -16525,8 +16536,10 @@ static void test_chat_ignore_eos_contract(void) {
         "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
         "\"ignore_eos\":true}",
         128, 32768, &r, err, sizeof(err));
-    TEST_ASSERT(!ok);
-    TEST_ASSERT(strstr(err, "temperature") != NULL);
+    /* No explicit temperature is fine now: the default temperature applies
+     * and EOS stops are suppressed. */
+    TEST_ASSERT(ok);
+    TEST_ASSERT(r.ignore_eos);
 
     ok = parse_chat_request(
         NULL, NULL,

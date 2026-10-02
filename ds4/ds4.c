@@ -41176,6 +41176,28 @@ static int sample_probabilities(const float *probs, uint32_t n_vocab,
     return best;
 }
 
+/* Point-mass speculative verbs, shared by the GLM session path and the
+ * qwen4exp sampled cycle's sampler binding.  `accept` is the q = delta(d)
+ * limit of min(1, p/q): a uniform draw against p(d).  `replacement` zeroes
+ * the rejected draft's mass and draws from what is left, the residual
+ * max(0, p - q) renormalized. */
+static bool sample_point_accept(float target_p, uint64_t *rng) {
+    if (!rng) return false;
+    if (!(target_p > 0.0f) || !isfinite(target_p)) return false;
+    if (target_p >= 1.0f) return true;
+    return sample_rng_f32(rng) <= target_p;
+}
+
+static int sample_point_replacement_probs(float *probs, uint32_t n_vocab,
+                                          int draft_token, uint64_t *rng) {
+    if (!probs || !rng || draft_token < 0 ||
+        (uint32_t)draft_token >= n_vocab) {
+        return -1;
+    }
+    probs[draft_token] = 0.0f;
+    return sample_probabilities(probs, n_vocab, rng);
+}
+
 /* Replace target_probs with normalized max(0, p-q) and sample it. This is the
  * correction that keeps speculative decoding distributed exactly as p after
  * a rejected draft token. */
@@ -41593,6 +41615,34 @@ int ds4_test_speculative_delta_sample(const float *target_logits,
     }
     target_probs[draft_token] = 0.0f;
     return sample_probabilities(target_probs, n_vocab, rng);
+}
+
+/* The production point-mass sequence the qwen4exp sampled cycle binds through
+ * its sampler seam: build the request's distribution, accept the point draft
+ * with one uniform draw, and on rejection draw the replacement from the row
+ * with the draft removed.  The test drives it over synthetic logits so the
+ * chi-square covers exactly this code. */
+int ds4_test_speculative_point_sample(const float *target_logits,
+                                      uint32_t n_vocab,
+                                      int draft_token,
+                                      float temperature,
+                                      int top_k,
+                                      float top_p,
+                                      float min_p,
+                                      uint64_t *rng,
+                                      float *target_probs) {
+    if (!target_logits || !rng || !target_probs || n_vocab == 0 ||
+        draft_token < 0 || (uint32_t)draft_token >= n_vocab ||
+        temperature <= 0.0f ||
+        !sample_build_probabilities(target_logits, n_vocab, temperature,
+                                    top_k, top_p, min_p, target_probs)) {
+        return -1;
+    }
+    if (sample_point_accept(target_probs[draft_token], rng)) {
+        return draft_token;
+    }
+    return sample_point_replacement_probs(target_probs, n_vocab,
+                                          draft_token, rng);
 }
 
 int ds4_test_argmax_excluding_logits(const float *logits, uint32_t n_vocab,
@@ -72497,12 +72547,9 @@ static int speculative_point_replacement(
         ds4_session *s,
         int draft_token,
         uint64_t *rng) {
-    if (!s || !s->sample_probs || !rng ||
-        draft_token < 0 || draft_token >= (int)DS4_N_VOCAB) {
-        return -1;
-    }
-    s->sample_probs[draft_token] = 0.0f;
-    return sample_probabilities(s->sample_probs, DS4_N_VOCAB, rng);
+    if (!s) return -1;
+    return sample_point_replacement_probs(s->sample_probs, DS4_N_VOCAB,
+                                          draft_token, rng);
 }
 
 static int ds4_session_eval_dspark_speculative_stochastic(
@@ -76602,6 +76649,13 @@ static int qwen4exp_seam_verify_rows(void *ctx, const int *tokens, uint32_t n,
     int32_t buf[DS4_QWEN4EXP_MTP_MAX_COMMIT];
     if (n > (uint32_t)(sizeof(buf) / sizeof(buf[0]))) return -1;
     for (uint32_t i = 0; i < n; i++) buf[i] = (int32_t)tokens[i];
+    /* The verify leaves session hyper rows 0..n-1 holding exactly these host
+     * rows, so the draft that follows may read them off the device (see
+     * qwen4exp_seam_draft_rows).  Publishing the mapping here is what lets the
+     * sampled leg's full-vocab verify use the device path the compact leg
+     * already had. */
+    s->qwen4exp_hc_host_base = hc_rows;
+    s->qwen4exp_hc_host_rows = n;
     return ds4_qwen4exp_graph_verify_rows(e->qwen4exp_session,
                                           e->qwen4exp_weights, &e->model,
                                           buf, n, hc_rows, row_logits,
@@ -76640,7 +76694,31 @@ static int qwen4exp_seam_read_logit_row(void *ctx, uint32_t row,
  * bit, and one implementation is how that is guaranteed rather than tested. */
 static int qwen4exp_seam_decode_token(void *ctx, int token, uint32_t pos,
                                       float *hc_row, float *logits) {
-    return qwen4exp_seam_verify_rows(ctx, &token, 1u, pos, hc_row, logits);
+    ds4_session *s = ctx;
+    const int rc = qwen4exp_seam_verify_rows(ctx, &token, 1u, pos,
+                                             hc_row, logits);
+    /* This is a REPLAY, not a verify: its one row lands at session hyper row
+     * 0, but it stands in for session row a + 1, and the cycle's own host slab
+     * is the authoritative copy.  Leaving the base armed would let a later
+     * draft read session row 0 -- the replay's row -- as if it were slab row
+     * 0, so disarm it: the draft that follows takes the host path. */
+    s->qwen4exp_hc_host_base = NULL;
+    s->qwen4exp_hc_host_rows = 0;
+    return rc;
+}
+
+/* Upload one host hc row over session hyper row dst_row.  The sampled leg's
+ * rejection replay needs it: the replay decode wrote session row 0, but the
+ * frontier row the wrapper retains is a + 1 -- this moves the replayed row to
+ * where the tail actually lives. */
+static int qwen4exp_seam_commit_hyper_row(void *ctx, const float *hc_row,
+                                          uint32_t dst_row) {
+    ds4_session *s = ctx;
+    const uint64_t hc_bytes =
+        (uint64_t)s->qwen4exp_seam.hc_dim * sizeof(float);
+    return ds4_gpu_tensor_write(
+               ds4_qwen4exp_session_hyper(s->engine->qwen4exp_session),
+               (uint64_t)dst_row * hc_bytes, hc_row, hc_bytes) ? 0 : -1;
 }
 
 static int qwen4exp_seam_head_logits(void *ctx, const float *hc_row,
@@ -76824,6 +76902,7 @@ static bool ds4_session_qwen4exp_spec_init(ds4_session *s,
     s->qwen4exp_seam.draft_step   = qwen4exp_seam_draft_step;
     s->qwen4exp_seam.draft_rows   = qwen4exp_seam_draft_rows;
     s->qwen4exp_seam.draft_margin = qwen4exp_seam_draft_margin;
+    s->qwen4exp_seam.commit_hyper_row = qwen4exp_seam_commit_hyper_row;
 
     const int depth = ds4_qwen4exp_mtp_depth_from_draft_tokens(
             e->mtp_draft_tokens, err, errlen);
@@ -76883,6 +76962,88 @@ static int ds4_session_qwen4exp_spec_cycle(ds4_session *s, int first_token,
      * for the whole MTP leg and ds4_session_tokens() omits every generated
      * token -- which is what ds4_bench's guard reads and what the server's
      * prefix reuse compares against. */
+    for (int i = 0; i < n; i++) token_vec_push(&s->checkpoint, accepted[i]);
+    if (n > 0) s->checkpoint_valid = true;
+    return n;
+}
+
+/* The request's sampler, bound to the cycle's seam.  build_probs is the same
+ * sample_build_probabilities the serial leg's truncation tests were written
+ * against; draw is sample_probabilities over a row that may have a draft's
+ * mass zeroed out. */
+typedef struct {
+    float     temperature;
+    int       top_k;
+    float     top_p;
+    float     min_p;
+    uint64_t *rng;
+} ds4_qwen4exp_sampler_ctx;
+
+static bool qwen4exp_sampler_build_probs(void *vctx, const float *logits,
+                                         uint32_t n_vocab, float *probs_out) {
+    const ds4_qwen4exp_sampler_ctx *c = vctx;
+    return sample_build_probabilities(logits, n_vocab, c->temperature,
+                                      c->top_k, c->top_p, c->min_p, probs_out);
+}
+
+static float qwen4exp_sampler_uniform(void *vctx) {
+    ds4_qwen4exp_sampler_ctx *c = vctx;
+    return sample_rng_f32(c->rng);
+}
+
+static int qwen4exp_sampler_draw(void *vctx, const float *probs,
+                                 uint32_t n_vocab) {
+    ds4_qwen4exp_sampler_ctx *c = vctx;
+    return sample_probabilities(probs, n_vocab, c->rng);
+}
+
+/* The sampled leg's routed entry: same wrapper tail as the greedy cycle --
+ * feed the retained tail, run the cycle over s->logits, retain the committed
+ * frontier row, push the commit into the checkpoint.  The differences live
+ * inside the cycle, which is why the retain row is still n - 1 and the
+ * pending parent is still the chain's own seed. */
+static int ds4_session_qwen4exp_spec_cycle_sampled(
+        ds4_session *s, int first_token,
+        int max_tokens, float temperature, int top_k,
+        float top_p, float min_p, uint64_t *rng,
+        int *accepted, int accepted_cap,
+        char *err, size_t errlen) {
+    ds4_engine *e = s->engine;
+    if (!ds4_session_qwen4exp_spec_init(s, err, errlen)) return -1;
+    if (!s->sample_probs) {
+        snprintf(err, errlen,
+                 "qwen4exp MTP: sampled cycle needs the session's probability "
+                 "scratch");
+        return -1;
+    }
+    if (s->qwen4exp_seam.n_vocab != (uint32_t)DS4_N_VOCAB) {
+        snprintf(err, errlen,
+                 "qwen4exp MTP: the sampler works over %u ids but the head "
+                 "reports %u",
+                 (uint32_t)DS4_N_VOCAB, s->qwen4exp_seam.n_vocab);
+        return -1;
+    }
+    const uint32_t pos = ds4_qwen4exp_session_pos(e->qwen4exp_session);
+    if (ds4_session_qwen4exp_cache_feed_tail(s, first_token, pos, err, errlen) != 0)
+        return -1;
+    ds4_qwen4exp_sampler_ctx sctx = {
+        temperature, top_k, top_p, min_p, rng
+    };
+    const ds4_qwen4exp_mtp_sampler sampler = {
+        &sctx,
+        qwen4exp_sampler_build_probs,
+        qwen4exp_sampler_uniform,
+        qwen4exp_sampler_draw,
+    };
+    const int n = ds4_qwen4exp_mtp_cycle_sampled(
+            &s->qwen4exp_spec, &s->qwen4exp_seam, &sampler, s->sample_probs,
+            first_token, pos, max_tokens, accepted, accepted_cap, s->logits,
+            err, errlen);
+    if (n > 0 && s->qwen4exp_head.cache_seed_capacity &&
+        ds4_qwen4exp_mtp_head_retain_cache_tail(&s->qwen4exp_head,
+            ds4_qwen4exp_session_hyper(e->qwen4exp_session), (uint32_t)n - 1u,
+            pos + (uint32_t)n - 1u, s->qwen4exp_spec.pending_parent,
+            err, errlen) != 0) return -1;
     for (int i = 0; i < n; i++) token_vec_push(&s->checkpoint, accepted[i]);
     if (n > 0) s->checkpoint_valid = true;
     return n;
@@ -78624,29 +78785,39 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                                  char *err, size_t errlen) {
 #ifndef DS4_NO_GPU
     if (ds4_session_qwen4exp_spec(s)) {
-        /* The cycle commits the target's own GREEDY argmax, which is what makes
-         * the MTP leg bit-identical to the serial leg.  Sampling would have to
-         * draw from the target and re-verify, and that is not this cycle -- so
-         * a sampled step decodes serially below rather than running the cycle
-         * and quietly ignoring the parameters. */
         /* TEMPERATURE is what decides greedy against sampled: every caller in
          * the tree sets top_k / top_p / min_p unconditionally and lets
-         * temperature 0 mean greedy, so refusing on those would refuse every
-         * greedy call that happens to carry a top_k.  The cycle commits the
-         * target's own greedy argmax, which is what makes the MTP leg
-         * bit-identical to the serial leg; only a positive temperature asks
-         * for something it does not do. */
+         * temperature 0 mean greedy.  Greedy takes the argmax cycle, which is
+         * what keeps the MTP leg bit-identical to the serial leg; a positive
+         * temperature takes the exact sampled cycle, whose drafts are point
+         * proposals verified against the request's own distribution. */
         if (temperature > 0.0f) {
-            /* A sampled step: the caller already drew first_token from the
-             * target's distribution, so commit it with one serial step --
-             * exactly what the caller does without --mtp-model -- and draft
-             * nothing.  ds4_session_eval invalidates any carried draft.
-             * (Erroring here broke every sampled request, including requests
-             * that omit temperature and get DS4_DEFAULT_TEMPERATURE.) */
-            if (!accepted || accepted_cap <= 0 || max_tokens <= 0) return 0;
-            if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
-            accepted[0] = first_token;
-            return 1;
+            /* Kill switches, both routed through today's serial step:
+             * DS4_QWEN4EXP_NO_SPEC_SAMPLING restores the sampled-requests-
+             * decode-serially behavior outright, and the approximate 2-row
+             * target screen (DS4_QWEN4EXP_TARGET_NATIVE_SCREEN) cannot feed
+             * the sampled cycle, whose accept test needs every row's full
+             * distribution.  A missing RNG or output room gets the same
+             * one-token step it always did. */
+            const bool no_spec_sampling =
+                getenv("DS4_QWEN4EXP_NO_SPEC_SAMPLING") != NULL;
+            const bool native_screen =
+                getenv("DS4_QWEN4EXP_TARGET_NATIVE_SCREEN") != NULL &&
+                getenv("DS4_QWEN4EXP_NO_TARGET_NATIVE_SCREEN") == NULL;
+            if (no_spec_sampling || native_screen || !rng ||
+                !accepted || accepted_cap <= 0 || max_tokens <= 0) {
+                if (!accepted || accepted_cap <= 0 || max_tokens <= 0) {
+                    return 0;
+                }
+                if (ds4_session_eval(s, first_token, err, errlen) != 0) {
+                    return -1;
+                }
+                accepted[0] = first_token;
+                return 1;
+            }
+            return ds4_session_qwen4exp_spec_cycle_sampled(
+                s, first_token, max_tokens, temperature, top_k, top_p,
+                min_p, rng, accepted, accepted_cap, err, errlen);
         }
         (void)top_k; (void)top_p; (void)min_p;
         return ds4_session_qwen4exp_spec_cycle(s, first_token, max_tokens,
